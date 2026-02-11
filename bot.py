@@ -11,7 +11,6 @@ from discord import app_commands, ui, SelectOption
 from discord.ext import commands
 from dotenv import load_dotenv
 import google.generativeai as genai
-import aiohttp
 from aiohttp import web
 
 # ────────────────────────────────────────────────
@@ -33,7 +32,7 @@ if not DEFAULT_GUILD_ID:
 # GEMINI CLIENT
 # ────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-1.5-flash"  # Use a valid model
+MODEL_NAME = "gemini-1.5-flash"  # or your preferred model
 
 JOI_SYSTEM_PROMPT = """
 You are JOI, an empathetic emotional-support AI inspired by the character from Blade Runner 2049.
@@ -52,13 +51,13 @@ USERS_FILE = DATA_DIR / "users.json"
 CONVERSATIONS_FILE = DATA_DIR / "conversations.json"
 EVENTS_FILE = DATA_DIR / "events.json"
 ASSIGNMENTS_FILE = DATA_DIR / "assignments.json"
-NOTES_FILE = DATA_DIR / "notes.json"  # New for study materials
+NOTES_FILE = DATA_DIR / "notes.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 
 for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE):
     if not f.exists():
-        f.write_text("{}")
+        f.write_text("{}", encoding="utf-8")
 
 file_lock = asyncio.Lock()
 
@@ -66,7 +65,7 @@ file_lock = asyncio.Lock()
 async def load_json(path):
     async with file_lock:
         try:
-            content = path.read_text().strip()
+            content = path.read_text(encoding="utf-8").strip()
             if not content:
                 return {}
             return json.loads(content)
@@ -78,7 +77,8 @@ async def load_json(path):
 async def save_json(path, data):
     async with file_lock:
         temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(data, indent=2))
+        temp.write_text(json.dumps(
+            data, indent=2, ensure_ascii=False), encoding="utf-8")
         temp.replace(path)
 
 # ────────────────────────────────────────────────
@@ -120,9 +120,8 @@ tree = bot.tree
 # ────────────────────────────────────────────────
 # EVENT REMINDER GLOBALS
 # ────────────────────────────────────────────────
-# guild_id: {event_id: {'remaining': [str], 'channel': Channel, 'title': str}}
 active_reminders = {}
-scheduled_tasks = {}    # guild_id: {event_id: Task}
+scheduled_tasks = {}
 
 
 def schedule_spam(guild_id: str, event_id: str, event: dict):
@@ -138,40 +137,34 @@ def schedule_spam(guild_id: str, event_id: str, event: dict):
             if not channel:
                 return
 
-            if guild_id not in active_reminders:
-                active_reminders[guild_id] = {}
-            remaining = event['members'][:]
-            active_reminders[guild_id][event_id] = {
-                'remaining': remaining,
+            active_reminders.setdefault(guild_id, {})[event_id] = {
+                'remaining': event['members'][:],
                 'channel': channel,
                 'title': event['title']
             }
 
-            while len(remaining) > 0:
+            while len(active_reminders[guild_id][event_id]['remaining']) > 0:
+                remaining = active_reminders[guild_id][event_id]['remaining']
                 mentions = ' '.join(f"<@{uid}>" for uid in remaining)
                 await channel.send(f"Reminder for event '{event['title']}': It's time! {mentions}")
                 await asyncio.sleep(3)
 
-            if guild_id in active_reminders and event_id in active_reminders[guild_id]:
-                del active_reminders[guild_id][event_id]
-            if guild_id in active_reminders and not active_reminders[guild_id]:
-                del active_reminders[guild_id]
+            active_reminders[guild_id].pop(event_id, None)
+            if not active_reminders[guild_id]:
+                active_reminders.pop(guild_id, None)
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
             print(f"Reminder error for {event_id}: {e}")
         finally:
-            if guild_id in scheduled_tasks and event_id in scheduled_tasks[guild_id]:
-                del scheduled_tasks[guild_id][event_id]
+            scheduled_tasks.get(guild_id, {}).pop(event_id, None)
 
     task = asyncio.create_task(inner())
-    if guild_id not in scheduled_tasks:
-        scheduled_tasks[guild_id] = {}
-    scheduled_tasks[guild_id][event_id] = task
+    scheduled_tasks.setdefault(guild_id, {})[event_id] = task
 
 # ────────────────────────────────────────────────
-# EVENT DATE/TIME SELECTION VIEW (safe dropdowns)
+# EVENT VIEWS
 # ────────────────────────────────────────────────
 
 
@@ -184,7 +177,6 @@ class EventScheduleView(ui.View):
         self.selected_hour = None
         self.selected_minute = None
 
-        # Date: next 7 days
         now = datetime.now()
         date_options = []
         for i in range(7):
@@ -202,7 +194,6 @@ class EventScheduleView(ui.View):
         self.date_select.callback = self.date_callback
         self.add_item(self.date_select)
 
-        # Hour: 00–23
         hour_options = [SelectOption(
             label=f"{h:02d}", value=f"{h:02d}") for h in range(24)]
         self.hour_select = ui.Select(
@@ -214,7 +205,6 @@ class EventScheduleView(ui.View):
         self.hour_select.callback = self.time_callback
         self.add_item(self.hour_select)
 
-        # Minute: 00,10,20,30,40,50
         minute_options = [SelectOption(label=m, value=m) for m in [
             "00", "10", "20", "30", "40", "50"]]
         self.minute_select = ui.Select(
@@ -226,7 +216,6 @@ class EventScheduleView(ui.View):
         self.minute_select.callback = self.time_callback
         self.add_item(self.minute_select)
 
-        # Confirm button
         self.confirm_button = ui.Button(
             label="Confirm & Schedule",
             style=discord.ButtonStyle.green,
@@ -284,10 +273,6 @@ class EventScheduleView(ui.View):
             view=None
         )
 
-# ────────────────────────────────────────────────
-# EVENT SELECT VIEW (delete / edit)
-# ────────────────────────────────────────────────
-
 
 class EventSelectView(ui.View):
     def __init__(self, events_list: list[tuple[str, dict]], action: str):
@@ -344,10 +329,10 @@ class EventSelectView(ui.View):
                 ephemeral=True
             )
 
-# ────────────────────────────────────────────────
-# ASSIGNMENT SELECT VIEW FOR FETCH
-# ────────────────────────────────────────────────
 
+# ────────────────────────────────────────────────
+# ASSIGNMENT SELECT VIEW
+# ────────────────────────────────────────────────
 
 class AssignmentSelectView(ui.View):
     def __init__(self, assignments_list: list[tuple[str, dict]]):
@@ -397,10 +382,10 @@ class AssignmentSelectView(ui.View):
 
         await interaction.response.send_message(embed=embed, files=files)
 
-# ────────────────────────────────────────────────
-# NEW NOTES SELECT VIEWS FOR /fetch-documents
-# ────────────────────────────────────────────────
 
+# ────────────────────────────────────────────────
+# NOTES VIEWS + /fetch-notes
+# ────────────────────────────────────────────────
 
 class SubjectSelectView(ui.View):
     def __init__(self, subjects: list[str]):
@@ -461,11 +446,8 @@ class NoteSelectView(ui.View):
         note = notes[guild_id][selected_id]
         file_paths = note.get('file_paths', [])
 
-        files = []
-        for path in file_paths:
-            p = Path(path)
-            if p.exists():
-                files.append(discord.File(path, filename=p.name))
+        files = [discord.File(path, filename=Path(path).name)
+                 for path in file_paths if Path(path).exists()]
 
         embed = discord.Embed(
             title=note['title'],
@@ -475,31 +457,101 @@ class NoteSelectView(ui.View):
         embed.add_field(
             name="Files", value=f"{len(file_paths)} file(s)", inline=True)
 
-        # ────────────────────────────────
-        # FIXED PART: do NOT set content=None
-        # ────────────────────────────────
-
-        # Option A: Remove view from original message and send new one (recommended)
-        # safe - keeps existing content
+        # Clean up original message by removing view only
         await interaction.message.edit(view=None)
 
-        if files:
-            await interaction.response.send_message(embed=embed, files=files)
-        else:
-            await interaction.response.send_message(embed=embed, content="(No files attached to this note)")
+        # Send the note content
+        await interaction.response.send_message(embed=embed, files=files)
 
-        # Option B: If you really want to "clear" the original message, use followup instead:
-        # await interaction.response.defer()
-        # await interaction.followup.send(embed=embed, files=files)
-        # await interaction.message.delete()   # optional - removes original select message
+
 # ────────────────────────────────────────────────
-# WEB SERVER FOR ASSIGNMENT UPLOAD SITE
+# MODALS & VIEWS FOR NOTES
 # ────────────────────────────────────────────────
 
+class NoteCreateModal(ui.Modal, title="Create New Note"):
+    note_title = ui.TextInput(
+        label="Title", placeholder="e.g. Math Notes Chapter 1", required=True)
+    note_subject = ui.TextInput(
+        label="Subject", placeholder="e.g. Math", required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        title = self.note_title.value.strip()
+        subject = self.note_subject.value.strip()
+
+        guild_id = str(interaction.guild_id)
+        notes = await load_json(NOTES_FILE)
+        if guild_id not in notes:
+            notes[guild_id] = {}
+
+        note_id = str(uuid.uuid4())
+        notes[guild_id][note_id] = {
+            'title': title,
+            'subject': subject,
+            'file_paths': [],
+            'creator_id': str(interaction.user.id)
+        }
+        await save_json(NOTES_FILE, notes)
+
+        await interaction.response.send_message(f"Note '**{title}**' created under **{subject}**.", ephemeral=False)
+
+
+class NoteAssignView(ui.View):
+    def __init__(self, notes_list: list[tuple[str, dict]], temp_paths: list[str]):
+        super().__init__(timeout=180.0)
+        self.temp_paths = temp_paths
+
+        options = []
+        for nid, data in notes_list:
+            label = f"{data['subject']} - {data['title']} ({nid[:8]})"
+            options.append(SelectOption(label=label[:100], value=nid))
+
+        self.select = ui.Select(
+            placeholder="Select note to assign files...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.callback
+        self.add_item(self.select)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_id = self.select.values[0]
+        notes = await load_json(NOTES_FILE)
+        guild_id = str(interaction.guild_id)
+
+        if guild_id not in notes or selected_id not in notes[guild_id]:
+            await interaction.response.send_message("Note not found.", ephemeral=True)
+            return
+
+        note = notes[guild_id][selected_id]
+        subject = note['subject']
+        assets_dir = Path("assets/notes") / subject.replace(" ", "_")
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        new_paths = []
+
+        for temp_path_str in self.temp_paths:
+            temp_path = Path(temp_path_str)
+            if temp_path.exists():
+                new_path = assets_dir / temp_path.name
+                temp_path.rename(new_path)
+                new_paths.append(str(new_path))
+
+        note['file_paths'].extend(new_paths)
+        await save_json(NOTES_FILE, notes)
+
+        await interaction.response.edit_message(
+            content=f"Added {len(new_paths)} file(s) to note '**{note['title']}**'.",
+            view=None
+        )
+
+
+# ────────────────────────────────────────────────
+# WEB SERVER
+# ────────────────────────────────────────────────
 
 async def handle_assignment_upload(request):
     if not DEFAULT_GUILD_ID:
-        return web.json_response({'status': 'error', 'message': 'Server not configured for web uploads'}, status=500)
+        return web.json_response({'status': 'error', 'message': 'Server not configured'}, status=500)
 
     guild_id = DEFAULT_GUILD_ID
 
@@ -542,12 +594,11 @@ async def handle_assignment_upload(request):
         if dt <= datetime.now():
             return web.json_response({'status': 'error', 'message': 'Deadline must be in the future'}, status=400)
         deadline_str = dt.strftime("%Y-%m-%d %H:%M")
-    except ValueValueError:
+    except ValueError:
         return web.json_response({'status': 'error', 'message': 'Invalid deadline format'}, status=400)
 
     assignments = await load_json(ASSIGNMENTS_FILE)
-    if guild_id not in assignments:
-        assignments[guild_id] = {}
+    assignments.setdefault(guild_id, {})
 
     assignment_id = str(uuid.uuid4())
     assets_dir = Path("assets/assignments") / subject.replace(" ", "_")
@@ -572,14 +623,10 @@ async def handle_assignment_upload(request):
 
     return web.json_response({'status': 'success'})
 
-# ────────────────────────────────────────────────
-# WEB SERVER FOR NOTES UPLOAD SITE
-# ────────────────────────────────────────────────
-
 
 async def handle_notes_upload(request):
     if not DEFAULT_GUILD_ID:
-        return web.json_response({'status': 'error', 'message': 'Server not configured for web uploads'}, status=500)
+        return web.json_response({'status': 'error', 'message': 'Server not configured'}, status=500)
 
     guild_id = DEFAULT_GUILD_ID
 
@@ -616,8 +663,7 @@ async def handle_notes_upload(request):
     subject = data['subject']
 
     notes = await load_json(NOTES_FILE)
-    if guild_id not in notes:
-        notes[guild_id] = {}
+    notes.setdefault(guild_id, {})
 
     note_id = str(uuid.uuid4())
     assets_dir = Path("assets/notes") / subject.replace(" ", "_")
@@ -653,9 +699,106 @@ async def start_web():
     await site.start()
     print("[WEB] Web server started at http://localhost:8080/assignments and http://localhost:8080/notes")
 
+
 # ────────────────────────────────────────────────
 # SLASH COMMANDS
 # ────────────────────────────────────────────────
+
+@tree.command(name="create-notes", description="Create a new note")
+async def cmd_create_notes(interaction: discord.Interaction):
+    await interaction.response.send_modal(NoteCreateModal())
+
+
+@tree.command(name="load-notes", description="Upload files to an existing note")
+async def cmd_load_notes(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    notes = await load_json(NOTES_FILE)
+
+    if guild_id not in notes or not notes[guild_id]:
+        await interaction.response.send_message(
+            "No notes found. Create one first with `/create-notes`.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        "Please reply to **this message** with your file attachments.\n"
+        "(You can attach multiple files in one message)",
+        ephemeral=False
+    )
+
+    initial_msg = await interaction.original_response()
+
+    def check(m: discord.Message):
+        return (
+            m.author.id == interaction.user.id
+            and m.reference is not None
+            and m.reference.message_id == initial_msg.id
+        )
+
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=300.0)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("Upload timed out (5 minutes).", ephemeral=True)
+        return
+
+    if not msg.attachments:
+        await interaction.followup.send("No files were attached in your reply.", ephemeral=True)
+        return
+
+    temp_dir = Path("assets/notes/temp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_paths = []
+
+    for att in msg.attachments:
+        temp_path = temp_dir / att.filename
+        await att.save(temp_path)
+        temp_paths.append(str(temp_path))
+
+    notes_list = [(nid, data) for nid, data in notes[guild_id].items()]
+
+    if not notes_list:
+        for p in temp_paths:
+            Path(p).unlink(missing_ok=True)
+        await interaction.followup.send("No notes available to assign to.", ephemeral=True)
+        return
+
+    view = NoteAssignView(notes_list, temp_paths)
+
+    await interaction.followup.send(
+        f"Uploaded **{len(temp_paths)}** file(s).\n"
+        "Select which note these files belong to:",
+        view=view,
+        ephemeral=False
+    )
+
+
+@tree.command(name="fetch-notes", description="List and fetch study notes")
+async def cmd_fetch_notes(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    notes = await load_json(NOTES_FILE)
+
+    if guild_id not in notes or not notes[guild_id]:
+        await interaction.response.send_message("No notes found in this server.", ephemeral=True)
+        return
+
+    subjects = sorted(set(data['subject']
+                      for data in notes[guild_id].values()))
+
+    if not subjects:
+        await interaction.response.send_message("No subjects with notes found.", ephemeral=True)
+        return
+
+    list_text = "**Available Subjects:**\n" + \
+        "\n".join(f"• {s}" for s in subjects)
+
+    view = SubjectSelectView(subjects)
+
+    await interaction.response.send_message(
+        list_text + "\n\nSelect a subject to view notes:",
+        view=view,
+        ephemeral=False
+    )
 
 
 @tree.command(name="set-event", description="Create a new event")
@@ -794,7 +937,6 @@ async def cmd_fetch_assignments(interaction: discord.Interaction):
         await interaction.response.send_message("No complete assignments found.", ephemeral=True)
         return
 
-    # Display list in message
     list_text = "**Available Assignments:**\n"
     for _, data in assign_list:
         list_text += f"• {data['subject']} | {data['title']} | Deadline: {data['deadline']}\n"
@@ -804,7 +946,7 @@ async def cmd_fetch_assignments(interaction: discord.Interaction):
     await interaction.response.send_message(
         list_text + "\nSelect one to view/download files:",
         view=view,
-        ephemeral=False  # visible to everyone for sharing
+        ephemeral=False
     )
 
 
@@ -833,37 +975,10 @@ async def cmd_timetable(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed, file=file)
 
-# ────────────────────────────────────────────────
-# NEW COMMAND /fetch-documents
-# ────────────────────────────────────────────────
-
-
-@tree.command(name="fetch-documents", description="Fetch study materials")
-async def cmd_fetch_documents(interaction: discord.Interaction):
-    guild_id = str(interaction.guild_id)
-    notes = await load_json(NOTES_FILE)
-
-    if guild_id not in notes or not notes[guild_id]:
-        await interaction.response.send_message("No study materials found in this server.", ephemeral=True)
-        return
-
-    subjects = sorted(set(data['subject']
-                      for data in notes[guild_id].values()))
-
-    view = SubjectSelectView(subjects)
-
-    await interaction.response.send_message(
-        "**Available Subjects:**\n" +
-        "\n".join(f"• {s}" for s in subjects) + "\n\nSelect subject:",
-        view=view,
-        ephemeral=False
-    )
-
 
 # ────────────────────────────────────────────────
 # EVENTS
 # ────────────────────────────────────────────────
-
 
 @bot.event
 async def on_ready():
