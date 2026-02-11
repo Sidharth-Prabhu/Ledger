@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 from aiohttp import web
 
+import firebase_admin
+from firebase_admin import credentials, firestore
+import math
+
 # ────────────────────────────────────────────────
 # ENV
 # ────────────────────────────────────────────────
@@ -52,11 +56,11 @@ CONVERSATIONS_FILE = DATA_DIR / "conversations.json"
 EVENTS_FILE = DATA_DIR / "events.json"
 ASSIGNMENTS_FILE = DATA_DIR / "assignments.json"
 NOTES_FILE = DATA_DIR / "notes.json"
-CALLS_FILE = DATA_DIR / "calls.json"  # New file for call spam sessions
+REGISTRATIONS_FILE = DATA_DIR / "registrations.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 
-for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE, CALLS_FILE):
+for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE, REGISTRATIONS_FILE):
     if not f.exists():
         f.write_text("{}", encoding="utf-8")
 
@@ -83,6 +87,12 @@ async def save_json(path, data):
         temp.replace(path)
 
 # ────────────────────────────────────────────────
+# LAB MANUALS DIRECTORY — THIS WAS MISSING!
+# ────────────────────────────────────────────────
+LAB_MANUALS_DIR = Path("lab-manuals")
+LAB_MANUALS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ────────────────────────────────────────────────
 # BOT SETUP
 # ────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -92,62 +102,132 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 tree = bot.tree
 
 # ────────────────────────────────────────────────
+# FIREBASE SETUP
+# ────────────────────────────────────────────────
+# Assume service_account.json is downloaded from Firebase and placed in the root directory
+SERVICE_ACCOUNT_PATH = 'aids-attendance-system-firebase-adminsdk.json'
+cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# Students list from the HTML
+students = [
+    {"reg": '2117240070256', "name": 'Ritesh M S'},
+    {"reg": '2117240070291', "name": 'Shanjithkrishna V'},
+    {"reg": '2117240070293', "name": 'Shanmuga Krishnan S M'},
+    {"reg": '2117240070304', "name": 'Shruthi S S'},
+    {"reg": '2117240070305', "name": 'Shyam Francis T'},
+    {"reg": '2117240070306', "name": 'Shylendhar M'},
+    {"reg": '2117240070308', "name": 'Sidharth P L'}
+]
+
+# Function to fetch attendance data (sync)
+
+
+def get_attendance_data(reg):
+    snap = db.collection('semester_4').get()
+    total = len(snap)
+    absent = 0
+    int_od = 0
+    ext_od = 0
+    abs_dates = []
+    int_dates = []
+    ext_dates = []
+    for doc in snap:
+        data = doc.to_dict()
+        date = doc.id
+        if reg in data.get('absents', []):
+            absent += 1
+            abs_dates.append(date)
+        if reg in data.get('internal_od', []):
+            int_od += 1
+            int_dates.append(date)
+        if reg in data.get('external_od', []):
+            ext_od += 1
+            ext_dates.append(date)
+    od = int_od + ext_od
+    present = total - absent
+    perc = (present / total * 100) if total > 0 else 0
+    required_present = math.ceil(0.75 * total)
+    max_allowed_absent = total - required_present
+    safe_leave_days = max(0, max_allowed_absent - absent)
+    if perc < 75:
+        status = "Critical"
+    elif perc < 80:
+        status = "Warning"
+    else:
+        status = "Good Standing"
+
+    def fmt_date(d):
+        year, month, day = d.split('-')
+        return f"{day}-{month}-{year}"
+    abs_dates_fmt = [fmt_date(d) for d in sorted(abs_dates)]
+    int_dates_fmt = [fmt_date(d) for d in sorted(int_dates)]
+    ext_dates_fmt = [fmt_date(d) for d in sorted(ext_dates)]
+    return {
+        "total": total,
+        "present": present,
+        "absent": absent,
+        "od": od,
+        "perc": perc,
+        "safe_leave_days": safe_leave_days,
+        "status": status,
+        "abs_dates": abs_dates_fmt,
+        "int_dates": int_dates_fmt,
+        "ext_dates": ext_dates_fmt
+    }
+
+
+# ────────────────────────────────────────────────
 # EVENT REMINDER GLOBALS
 # ────────────────────────────────────────────────
 active_reminders = {}
 scheduled_tasks = {}
 
-# ────────────────────────────────────────────────
-# CALL SPAM GLOBALS (parallel structure to reminders)
-# ────────────────────────────────────────────────
-# guild_id → {call_id → {'remaining': [...], 'channel': ..., 'end_time': ...}}
-active_calls = {}
-scheduled_call_tasks = {}       # guild_id → {call_id → Task}
 
-
-def schedule_call_spam(guild_id: str, call_id: str, call_data: dict):
+def schedule_spam(guild_id: str, event_id: str, event: dict):
     async def inner():
         try:
-            # Optional delay before starting spam
-            delay_minutes = call_data.get('start_after', 0)
-            if delay_minutes > 0:
-                await asyncio.sleep(delay_minutes * 60)
+            dt = datetime.fromisoformat(event['datetime'])
+            now = datetime.now()
+            if dt <= now:
+                return
+            await asyncio.sleep((dt - now).total_seconds())
 
-            channel = bot.get_channel(call_data['channel_id'])
+            channel = bot.get_channel(event['channel_id'])
             if not channel:
                 return
 
-            active_calls.setdefault(guild_id, {})[call_id] = {
-                'remaining': call_data['members'][:],
-                'channel': channel
+            active_reminders.setdefault(guild_id, {})[event_id] = {
+                'remaining': event['members'][:],
+                'channel': channel,
+                'title': event['title']
             }
 
-            # Infinite loop until manually stopped or no one left
-            while active_calls.get(guild_id, {}).get(call_id):
-                remaining = active_calls[guild_id][call_id]['remaining']
-                if not remaining:
-                    break
+            while len(active_reminders[guild_id][event_id]['remaining']) > 0:
+                remaining = active_reminders[guild_id][event_id]['remaining']
                 mentions = ' '.join(f"<@{uid}>" for uid in remaining)
-                await channel.send(f"**CALLING!** Join the voice channel! {mentions}")
-                await asyncio.sleep(2)  # 2 seconds interval
+                await channel.send(f"Reminder for event '{event['title']}': It's time! {mentions}")
+                await asyncio.sleep(3)
 
-            # Cleanup when done
-            active_calls[guild_id].pop(call_id, None)
-            if not active_calls[guild_id]:
-                active_calls.pop(guild_id, None)
+            active_reminders[guild_id].pop(event_id, None)
+            if not active_reminders[guild_id]:
+                active_reminders.pop(guild_id, None)
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"Call spam error {call_id}: {e}")
+            print(f"Reminder error for {event_id}: {e}")
         finally:
-            scheduled_call_tasks.get(guild_id, {}).pop(call_id, None)
+            scheduled_tasks.get(guild_id, {}).pop(event_id, None)
 
     task = asyncio.create_task(inner())
-    scheduled_call_tasks.setdefault(guild_id, {})[call_id] = task
+    scheduled_tasks.setdefault(guild_id, {})[event_id] = task
+
 # ────────────────────────────────────────────────
 # EVENT VIEWS (unchanged)
 # ────────────────────────────────────────────────
+
 
 class EventScheduleView(ui.View):
     def __init__(self, event_id: str, title: str):
@@ -443,21 +523,14 @@ class NoteSelectView(ui.View):
 
 
 # ────────────────────────────────────────────────
-# MODAL & VIEW FOR NOTES
+# MODALS & VIEWS FOR NOTES & ASSIGNMENTS
 # ────────────────────────────────────────────────
-
 
 class NoteCreateModal(ui.Modal, title="Create New Note"):
     note_title = ui.TextInput(
-        label="Title",
-        placeholder="e.g. Math Notes Chapter 1",
-        required=True
-    )
+        label="Title", placeholder="e.g. Math Notes Chapter 1", required=True)
     note_subject = ui.TextInput(
-        label="Subject",
-        placeholder="e.g. Math",
-        required=True
-    )
+        label="Subject", placeholder="e.g. Math", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
         title = self.note_title.value.strip()
@@ -528,10 +601,6 @@ class NoteAssignView(ui.View):
             content=f"Added {len(new_paths)} file(s) to note '**{note['title']}**'.",
             view=None
         )
-
-# ────────────────────────────────────────────────
-# NEW MODAL & VIEW FOR ASSIGNMENTS (similar to notes)
-# ────────────────────────────────────────────────
 
 
 class AssignmentCreateModal(ui.Modal, title="Create New Assignment"):
@@ -631,90 +700,127 @@ class AssignmentAssignView(ui.View):
         )
 
 # ────────────────────────────────────────────────
-# NEW CALL SPAM COMMANDS
+# LAB MANUAL COMMANDS
 # ────────────────────────────────────────────────
 
 
-@tree.command(name="call", description="Start calling mentioned users every 2 seconds (after optional delay)")
-@app_commands.describe(
-    delay_minutes="Delay before starting the spam (in minutes, default 0)",
-    members="Mention members with @ (space separated)"
-)
-async def cmd_call(interaction: discord.Interaction, delay_minutes: int = 0, members: str = ""):
-    member_ids = re.findall(r'<@!?(\d+)>', members)
-    if not member_ids:
-        await interaction.response.send_message("No valid members mentioned.", ephemeral=True)
+@tree.command(name="add-lab-manual", description="Create a new lab manual subject folder")
+@app_commands.describe(subject="Name of the lab/subject (e.g. Data Structures Lab)")
+async def cmd_add_lab_manual(interaction: discord.Interaction, subject: str):
+    folder_name = re.sub(r'[^a-zA-Z0-9_-]', '_', subject.strip())
+    folder_path = LAB_MANUALS_DIR / folder_name
+
+    if folder_path.exists():
+        await interaction.response.send_message(
+            f"Lab manual for **{subject}** (`{folder_name}`) already exists.", ephemeral=True
+        )
         return
 
-    if delay_minutes < 0:
-        await interaction.response.send_message("Delay cannot be negative.", ephemeral=True)
+    try:
+        folder_path.mkdir(parents=True, exist_ok=True)
+        await interaction.response.send_message(
+            f"Lab manual subject **{subject}** created.\n"
+            f"Folder: `lab-manuals/{folder_name}/`\n"
+            "Add experiment files manually (e.g. `exp1.txt`, `exp2.txt`, etc.)",
+            ephemeral=False
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to create folder: {str(e)}", ephemeral=True)
+
+
+@tree.command(name="fetch-lab-manual-programs", description="Browse and get lab manual experiment code")
+async def cmd_fetch_lab_manual(interaction: discord.Interaction):
+    if not LAB_MANUALS_DIR.exists() or not any(LAB_MANUALS_DIR.iterdir()):
+        await interaction.response.send_message(
+            "No lab manuals found. Create one with `/add-lab-manual`.",
+            ephemeral=True
+        )
         return
 
-    guild_id = str(interaction.guild_id)
-    calls = await load_json(CALLS_FILE)
-    calls.setdefault(guild_id, {})
+    subjects = [d.name.replace('_', ' ')
+                for d in LAB_MANUALS_DIR.iterdir() if d.is_dir()]
+    subjects.sort()
 
-    call_id = str(uuid.uuid4())
-    calls[guild_id][call_id] = {
-        'members': member_ids,
-        'creator_id': str(interaction.user.id),
-        'channel_id': interaction.channel_id,
-        'start_after': delay_minutes  # minutes to wait before first ping
-    }
-    await save_json(CALLS_FILE, calls)
-
-    mentions_str = ' '.join(f'<@{mid}>' for mid in member_ids)
-
-    # Schedule the spam (with delay if any)
-    schedule_call_spam(guild_id, call_id, calls[guild_id][call_id])
-
-    delay_text = f"after {delay_minutes} minutes" if delay_minutes > 0 else "immediately"
-    await interaction.response.send_message(
-        f"Started calling {mentions_str} every **2 seconds** ({delay_text}).\n"
-        "Use `/stop-calling` to stop being pinged.",
-        ephemeral=False
-    )
-
-
-@tree.command(name="stop-calling", description="Stop being pinged by active call spam")
-async def cmd_stop_calling(interaction: discord.Interaction):
-    guild_id = str(interaction.guild_id)
-    user_id = str(interaction.user.id)
-
-    if guild_id not in active_calls or not active_calls[guild_id]:
-        await interaction.response.send_message("You are not currently being called.", ephemeral=True)
+    if not subjects:
+        await interaction.response.send_message("No lab manual subjects found.", ephemeral=True)
         return
 
-    stopped = False
+    class SubjectDropdown(ui.View):
+        def __init__(self):
+            super().__init__(timeout=180)
+            subject_select = ui.Select(
+                placeholder="Select Lab Manual Subject...",
+                options=[SelectOption(label=s, value=s.replace(' ', '_'))
+                         for s in subjects]
+            )
+            subject_select.callback = self.on_subject_select
+            self.add_item(subject_select)
 
-    for call_id, data in list(active_calls[guild_id].items()):
-        if user_id in data['remaining']:
-            data['remaining'].remove(user_id)
-            stopped = True
+        async def on_subject_select(self, inter: discord.Interaction):
+            # cleaned name (with underscores)
+            folder_name = inter.data["values"][0]
+            subject_path = LAB_MANUALS_DIR / folder_name
 
-            # If no one left, fully stop this call
-            if not data['remaining']:
-                if guild_id in scheduled_call_tasks and call_id in scheduled_call_tasks[guild_id]:
-                    scheduled_call_tasks[guild_id][call_id].cancel()
-                    del scheduled_call_tasks[guild_id][call_id]
-                del active_calls[guild_id][call_id]
+            experiments = []
+            for file in subject_path.glob("exp*.txt"):
+                try:
+                    num = int(file.stem.replace("exp", ""))
+                    experiments.append((num, file.name, str(file)))
+                except ValueError:
+                    continue
 
-                calls = await load_json(CALLS_FILE)
-                if guild_id in calls and call_id in calls[guild_id]:
-                    del calls[guild_id][call_id]
-                    await save_json(CALLS_FILE, calls)
+            if not experiments:
+                await inter.response.send_message(
+                    f"No experiment files (`exp*.txt`) found in **{folder_name.replace('_', ' ')}**.",
+                    ephemeral=True
+                )
+                return
 
-    if guild_id in active_calls and not active_calls[guild_id]:
-        del active_calls[guild_id]
+            experiments.sort(key=lambda x: x[0])
 
-    if stopped:
-        await interaction.response.send_message("You have been removed from active call spam.", ephemeral=False)
-    else:
-        await interaction.response.send_message("You weren't in any active call lists.", ephemeral=True)
+            class ExperimentDropdown(ui.View):
+                def __init__(self):
+                    super().__init__(timeout=180)
+                    exp_select = ui.Select(
+                        placeholder="Select Experiment...",
+                        options=[SelectOption(
+                            label=f"Experiment {num} - {fname}",
+                            value=file_path
+                        ) for num, fname, file_path in experiments]
+                    )
+                    exp_select.callback = self.on_exp_select
+                    self.add_item(exp_select)
 
+                async def on_exp_select(self, inter2: discord.Interaction):
+                    file_path = Path(inter2.data["values"][0])
+                    if not file_path.exists():
+                        await inter2.response.send_message("File disappeared.", ephemeral=True)
+                        return
+
+                    try:
+                        content = file_path.read_text(encoding="utf-8")
+                        if len(content) > 1900:
+                            content = content[:1900] + \
+                                "\n\n... (truncated - full file on server)"
+                        await inter2.response.send_message(
+                            f"**Experiment from {folder_name.replace('_', ' ')}**\n"
+                            f"```{file_path.name}```\n```txt\n{content}\n```",
+                            ephemeral=False
+                        )
+                    except Exception as e:
+                        await inter2.response.send_message(f"Error reading file: {str(e)}", ephemeral=True)
+
+            await inter.response.edit_message(
+                content=f"Select experiment from **{folder_name.replace('_', ' ')}**:",
+                view=ExperimentDropdown()
+            )
+
+    view = SubjectDropdown()
+    await interaction.response.send_message("Select lab manual subject:", view=view, ephemeral=False)
 # ────────────────────────────────────────────────
 # WEB SERVER
 # ────────────────────────────────────────────────
+
 
 async def handle_assignment_upload(request):
     if not DEFAULT_GUILD_ID:
@@ -866,10 +972,10 @@ async def start_web():
     await site.start()
     print("[WEB] Web server started at http://localhost:8080/assignments and http://localhost:8080/notes")
 
-
 # ────────────────────────────────────────────────
 # SLASH COMMANDS
 # ────────────────────────────────────────────────
+
 
 @tree.command(name="create-notes", description="Create a new note")
 async def cmd_create_notes(interaction: discord.Interaction):
@@ -935,6 +1041,75 @@ async def cmd_load_notes(interaction: discord.Interaction):
     await interaction.followup.send(
         f"Uploaded **{len(temp_paths)}** file(s).\n"
         "Select which note these files belong to:",
+        view=view,
+        ephemeral=False
+    )
+
+
+@tree.command(name="create-assignment", description="Create a new assignment")
+async def cmd_create_assignment(interaction: discord.Interaction):
+    await interaction.response.send_modal(AssignmentCreateModal())
+
+
+@tree.command(name="load-assignment", description="Upload files to an existing assignment")
+async def cmd_load_assignment(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    assignments = await load_json(ASSIGNMENTS_FILE)
+
+    if guild_id not in assignments or not assignments[guild_id]:
+        await interaction.response.send_message(
+            "No assignments found. Create one first with `/create-assignment`.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        "Please reply to **this message** with your file attachments.\n"
+        "(You can attach multiple files in one message)",
+        ephemeral=False
+    )
+
+    initial_msg = await interaction.original_response()
+
+    def check(m: discord.Message):
+        return (
+            m.author.id == interaction.user.id
+            and m.reference is not None
+            and m.reference.message_id == initial_msg.id
+        )
+
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=300.0)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("Upload timed out (5 minutes).", ephemeral=True)
+        return
+
+    if not msg.attachments:
+        await interaction.followup.send("No files were attached in your reply.", ephemeral=True)
+        return
+
+    temp_dir = Path("assets/assignments/temp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_paths = []
+
+    for att in msg.attachments:
+        temp_path = temp_dir / att.filename
+        await att.save(temp_path)
+        temp_paths.append(str(temp_path))
+
+    assign_list = [(aid, data) for aid, data in assignments[guild_id].items()]
+
+    if not assign_list:
+        for p in temp_paths:
+            Path(p).unlink(missing_ok=True)
+        await interaction.followup.send("No assignments available to assign to.", ephemeral=True)
+        return
+
+    view = AssignmentAssignView(assign_list, temp_paths)
+
+    await interaction.followup.send(
+        f"Uploaded **{len(temp_paths)}** file(s).\n"
+        "Select which assignment these files belong to:",
         view=view,
         ephemeral=False
     )
@@ -1143,9 +1318,86 @@ async def cmd_timetable(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, file=file)
 
 
+@tree.command(name="check-attendance", description="Check your attendance from Firebase")
+async def cmd_check_attendance(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+
+    username = interaction.user.name
+    registrations = await load_json(REGISTRATIONS_FILE)
+    reg = registrations.get(username)
+
+    if not reg:
+        await interaction.followup.send("No registration number found for your username. Please ensure registrations.json has your username mapped to reg number.")
+        return
+
+    student = next((s for s in students if s["reg"] == reg), None)
+    if not student:
+        await interaction.followup.send("Invalid registration number associated with your username.")
+        return
+
+    name = student["name"]
+
+    loop = asyncio.get_running_loop()
+    try:
+        attendance = await loop.run_in_executor(None, get_attendance_data, reg)
+    except Exception as e:
+        await interaction.followup.send(f"Error fetching attendance: {str(e)}")
+        return
+
+    if attendance["perc"] < 75:
+        color = 0xef4444  # red
+    elif attendance["perc"] < 80:
+        color = 0xf59e0b  # yellow
+    else:
+        color = 0x10b981  # green
+
+    embed = discord.Embed(title=f"{name}'s Attendance Dashboard", color=color)
+    embed.add_field(name="Registration Number", value=reg, inline=False)
+    embed.add_field(name="Status", value=attendance["status"], inline=True)
+    embed.add_field(name="Attendance Percentage",
+                    value=f"{attendance['perc']:.2f}%", inline=True)
+    embed.add_field(name="Total Days", value=str(
+        attendance["total"]), inline=True)
+    embed.add_field(name="Present Days", value=str(
+        attendance["present"]), inline=True)
+    embed.add_field(name="Absent Days", value=str(
+        attendance["absent"]), inline=True)
+    embed.add_field(name="On Duty Days", value=str(
+        attendance["od"]), inline=True)
+    embed.add_field(name="Safe Leave Days", value=str(
+        attendance["safe_leave_days"]), inline=False)
+
+    abs_str = "\n".join(attendance["abs_dates"]
+                        ) if attendance["abs_dates"] else "None"
+    if len(abs_str) > 1024:
+        abs_str = f"Too many to list ({attendance['absent']} absent days). Check website for details."
+
+    int_str = "\n".join(attendance["int_dates"]
+                        ) if attendance["int_dates"] else "None"
+    if len(int_str) > 1024:
+        int_str = f"Too many to list."
+
+    ext_str = "\n".join(attendance["ext_dates"]
+                        ) if attendance["ext_dates"] else "None"
+    if len(ext_str) > 1024:
+        ext_str = f"Too many to list."
+
+    embed.add_field(name="Absent Dates (DD-MM-YYYY)",
+                    value=abs_str, inline=False)
+    embed.add_field(name="Internal OD Dates (DD-MM-YYYY)",
+                    value=int_str, inline=False)
+    embed.add_field(name="External OD Dates (DD-MM-YYYY)",
+                    value=ext_str, inline=False)
+
+    embed.set_footer(
+        text="Data fetched from Firebase. Legend: Red=Absent, Blue=Present, Yellow=OD, Purple=Holiday (not tracked here)")
+
+    await interaction.followup.send(embed=embed)
+
 # ────────────────────────────────────────────────
-# BOT EVENTS
+# EVENTS
 # ────────────────────────────────────────────────
+
 
 @bot.event
 async def on_ready():

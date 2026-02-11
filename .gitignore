@@ -14,6 +14,7 @@ data/
 # Environment variables
 .env
 ads.txt
+aids-attendance-system-firebase-adminsdk.json
 
 assignments/
 notes/
