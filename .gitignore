@@ -1,0 +1,19 @@
+# Virtual environments
+.venv/
+env/
+
+# Build / cache directories
+build/
+dist/
+__pycache__/
+
+# Logs / runtime data
+logs/
+data/
+
+# Environment variables
+.env
+ads.txt
+
+assignments/
+notes/
