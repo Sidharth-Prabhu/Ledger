@@ -52,10 +52,11 @@ CONVERSATIONS_FILE = DATA_DIR / "conversations.json"
 EVENTS_FILE = DATA_DIR / "events.json"
 ASSIGNMENTS_FILE = DATA_DIR / "assignments.json"
 NOTES_FILE = DATA_DIR / "notes.json"
+CALLS_FILE = DATA_DIR / "calls.json"  # New file for call spam sessions
 
 DATA_DIR.mkdir(exist_ok=True)
 
-for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE):
+for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE, CALLS_FILE):
     if not f.exists():
         f.write_text("{}", encoding="utf-8")
 
@@ -96,50 +97,57 @@ tree = bot.tree
 active_reminders = {}
 scheduled_tasks = {}
 
+# ────────────────────────────────────────────────
+# CALL SPAM GLOBALS (parallel structure to reminders)
+# ────────────────────────────────────────────────
+# guild_id → {call_id → {'remaining': [...], 'channel': ..., 'end_time': ...}}
+active_calls = {}
+scheduled_call_tasks = {}       # guild_id → {call_id → Task}
 
-def schedule_spam(guild_id: str, event_id: str, event: dict):
+
+def schedule_call_spam(guild_id: str, call_id: str, call_data: dict):
     async def inner():
         try:
-            dt = datetime.fromisoformat(event['datetime'])
-            now = datetime.now()
-            if dt <= now:
-                return
-            await asyncio.sleep((dt - now).total_seconds())
+            # Optional delay before starting spam
+            delay_minutes = call_data.get('start_after', 0)
+            if delay_minutes > 0:
+                await asyncio.sleep(delay_minutes * 60)
 
-            channel = bot.get_channel(event['channel_id'])
+            channel = bot.get_channel(call_data['channel_id'])
             if not channel:
                 return
 
-            active_reminders.setdefault(guild_id, {})[event_id] = {
-                'remaining': event['members'][:],
-                'channel': channel,
-                'title': event['title']
+            active_calls.setdefault(guild_id, {})[call_id] = {
+                'remaining': call_data['members'][:],
+                'channel': channel
             }
 
-            while len(active_reminders[guild_id][event_id]['remaining']) > 0:
-                remaining = active_reminders[guild_id][event_id]['remaining']
+            # Infinite loop until manually stopped or no one left
+            while active_calls.get(guild_id, {}).get(call_id):
+                remaining = active_calls[guild_id][call_id]['remaining']
+                if not remaining:
+                    break
                 mentions = ' '.join(f"<@{uid}>" for uid in remaining)
-                await channel.send(f"Reminder for event '{event['title']}': It's time! {mentions}")
-                await asyncio.sleep(3)
+                await channel.send(f"**CALLING!** Join the voice channel! {mentions}")
+                await asyncio.sleep(2)  # 2 seconds interval
 
-            active_reminders[guild_id].pop(event_id, None)
-            if not active_reminders[guild_id]:
-                active_reminders.pop(guild_id, None)
+            # Cleanup when done
+            active_calls[guild_id].pop(call_id, None)
+            if not active_calls[guild_id]:
+                active_calls.pop(guild_id, None)
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"Reminder error for {event_id}: {e}")
+            print(f"Call spam error {call_id}: {e}")
         finally:
-            scheduled_tasks.get(guild_id, {}).pop(event_id, None)
+            scheduled_call_tasks.get(guild_id, {}).pop(call_id, None)
 
     task = asyncio.create_task(inner())
-    scheduled_tasks.setdefault(guild_id, {})[event_id] = task
-
+    scheduled_call_tasks.setdefault(guild_id, {})[call_id] = task
 # ────────────────────────────────────────────────
-# EVENT VIEWS
+# EVENT VIEWS (unchanged)
 # ────────────────────────────────────────────────
-
 
 class EventScheduleView(ui.View):
     def __init__(self, event_id: str, title: str):
@@ -433,6 +441,7 @@ class NoteSelectView(ui.View):
         await interaction.message.edit(view=None)
         await interaction.response.send_message(embed=embed, files=files)
 
+
 # ────────────────────────────────────────────────
 # MODAL & VIEW FOR NOTES
 # ────────────────────────────────────────────────
@@ -622,9 +631,90 @@ class AssignmentAssignView(ui.View):
         )
 
 # ────────────────────────────────────────────────
-# WEB SERVER
+# NEW CALL SPAM COMMANDS
 # ────────────────────────────────────────────────
 
+
+@tree.command(name="call", description="Start calling mentioned users every 2 seconds (after optional delay)")
+@app_commands.describe(
+    delay_minutes="Delay before starting the spam (in minutes, default 0)",
+    members="Mention members with @ (space separated)"
+)
+async def cmd_call(interaction: discord.Interaction, delay_minutes: int = 0, members: str = ""):
+    member_ids = re.findall(r'<@!?(\d+)>', members)
+    if not member_ids:
+        await interaction.response.send_message("No valid members mentioned.", ephemeral=True)
+        return
+
+    if delay_minutes < 0:
+        await interaction.response.send_message("Delay cannot be negative.", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild_id)
+    calls = await load_json(CALLS_FILE)
+    calls.setdefault(guild_id, {})
+
+    call_id = str(uuid.uuid4())
+    calls[guild_id][call_id] = {
+        'members': member_ids,
+        'creator_id': str(interaction.user.id),
+        'channel_id': interaction.channel_id,
+        'start_after': delay_minutes  # minutes to wait before first ping
+    }
+    await save_json(CALLS_FILE, calls)
+
+    mentions_str = ' '.join(f'<@{mid}>' for mid in member_ids)
+
+    # Schedule the spam (with delay if any)
+    schedule_call_spam(guild_id, call_id, calls[guild_id][call_id])
+
+    delay_text = f"after {delay_minutes} minutes" if delay_minutes > 0 else "immediately"
+    await interaction.response.send_message(
+        f"Started calling {mentions_str} every **2 seconds** ({delay_text}).\n"
+        "Use `/stop-calling` to stop being pinged.",
+        ephemeral=False
+    )
+
+
+@tree.command(name="stop-calling", description="Stop being pinged by active call spam")
+async def cmd_stop_calling(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    user_id = str(interaction.user.id)
+
+    if guild_id not in active_calls or not active_calls[guild_id]:
+        await interaction.response.send_message("You are not currently being called.", ephemeral=True)
+        return
+
+    stopped = False
+
+    for call_id, data in list(active_calls[guild_id].items()):
+        if user_id in data['remaining']:
+            data['remaining'].remove(user_id)
+            stopped = True
+
+            # If no one left, fully stop this call
+            if not data['remaining']:
+                if guild_id in scheduled_call_tasks and call_id in scheduled_call_tasks[guild_id]:
+                    scheduled_call_tasks[guild_id][call_id].cancel()
+                    del scheduled_call_tasks[guild_id][call_id]
+                del active_calls[guild_id][call_id]
+
+                calls = await load_json(CALLS_FILE)
+                if guild_id in calls and call_id in calls[guild_id]:
+                    del calls[guild_id][call_id]
+                    await save_json(CALLS_FILE, calls)
+
+    if guild_id in active_calls and not active_calls[guild_id]:
+        del active_calls[guild_id]
+
+    if stopped:
+        await interaction.response.send_message("You have been removed from active call spam.", ephemeral=False)
+    else:
+        await interaction.response.send_message("You weren't in any active call lists.", ephemeral=True)
+
+# ────────────────────────────────────────────────
+# WEB SERVER
+# ────────────────────────────────────────────────
 
 async def handle_assignment_upload(request):
     if not DEFAULT_GUILD_ID:
@@ -776,10 +866,10 @@ async def start_web():
     await site.start()
     print("[WEB] Web server started at http://localhost:8080/assignments and http://localhost:8080/notes")
 
+
 # ────────────────────────────────────────────────
 # SLASH COMMANDS
 # ────────────────────────────────────────────────
-
 
 @tree.command(name="create-notes", description="Create a new note")
 async def cmd_create_notes(interaction: discord.Interaction):
@@ -845,75 +935,6 @@ async def cmd_load_notes(interaction: discord.Interaction):
     await interaction.followup.send(
         f"Uploaded **{len(temp_paths)}** file(s).\n"
         "Select which note these files belong to:",
-        view=view,
-        ephemeral=False
-    )
-
-
-@tree.command(name="create-assignment", description="Create a new assignment")
-async def cmd_create_assignment(interaction: discord.Interaction):
-    await interaction.response.send_modal(AssignmentCreateModal())
-
-
-@tree.command(name="load-assignment", description="Upload files to an existing assignment")
-async def cmd_load_assignment(interaction: discord.Interaction):
-    guild_id = str(interaction.guild_id)
-    assignments = await load_json(ASSIGNMENTS_FILE)
-
-    if guild_id not in assignments or not assignments[guild_id]:
-        await interaction.response.send_message(
-            "No assignments found. Create one first with `/create-assignment`.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        "Please reply to **this message** with your file attachments.\n"
-        "(You can attach multiple files in one message)",
-        ephemeral=False
-    )
-
-    initial_msg = await interaction.original_response()
-
-    def check(m: discord.Message):
-        return (
-            m.author.id == interaction.user.id
-            and m.reference is not None
-            and m.reference.message_id == initial_msg.id
-        )
-
-    try:
-        msg = await bot.wait_for('message', check=check, timeout=300.0)
-    except asyncio.TimeoutError:
-        await interaction.followup.send("Upload timed out (5 minutes).", ephemeral=True)
-        return
-
-    if not msg.attachments:
-        await interaction.followup.send("No files were attached in your reply.", ephemeral=True)
-        return
-
-    temp_dir = Path("assets/assignments/temp")
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_paths = []
-
-    for att in msg.attachments:
-        temp_path = temp_dir / att.filename
-        await att.save(temp_path)
-        temp_paths.append(str(temp_path))
-
-    assign_list = [(aid, data) for aid, data in assignments[guild_id].items()]
-
-    if not assign_list:
-        for p in temp_paths:
-            Path(p).unlink(missing_ok=True)
-        await interaction.followup.send("No assignments available to assign to.", ephemeral=True)
-        return
-
-    view = AssignmentAssignView(assign_list, temp_paths)
-
-    await interaction.followup.send(
-        f"Uploaded **{len(temp_paths)}** file(s).\n"
-        "Select which assignment these files belong to:",
         view=view,
         ephemeral=False
     )
@@ -1123,7 +1144,7 @@ async def cmd_timetable(interaction: discord.Interaction):
 
 
 # ────────────────────────────────────────────────
-# EVENTS
+# BOT EVENTS
 # ────────────────────────────────────────────────
 
 @bot.event
