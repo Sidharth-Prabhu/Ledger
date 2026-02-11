@@ -32,7 +32,7 @@ if not DEFAULT_GUILD_ID:
 # GEMINI CLIENT
 # ────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-1.5-flash"  # or your preferred model
+MODEL_NAME = "gemini-1.5-flash"
 
 JOI_SYSTEM_PROMPT = """
 You are JOI, an empathetic emotional-support AI inspired by the character from Blade Runner 2049.
@@ -80,33 +80,6 @@ async def save_json(path, data):
         temp.write_text(json.dumps(
             data, indent=2, ensure_ascii=False), encoding="utf-8")
         temp.replace(path)
-
-# ────────────────────────────────────────────────
-# QUESTIONNAIRE + PROFILE PARSER
-# ────────────────────────────────────────────────
-questionnaire = [
-    "What's your age?",
-    "How would you describe your current mood?",
-    "What are some things you enjoy doing?",
-    "What challenges are you facing right now?"
-]
-
-profile_fields = ["age", "mood", "hobbies", "challenges"]
-
-
-def parse_profile_update(message):
-    patterns = {
-        "nickname": r"update my nickname to (.+)",
-        "age": r"update my age to (\d+)",
-        "mood": r"my mood is (.+)",
-        "hobbies": r"my hobbies are (.+)"
-    }
-    for key, pattern in patterns.items():
-        match = re.match(pattern, message, re.IGNORECASE)
-        if match:
-            return key, match.group(1)
-    return None, None
-
 
 # ────────────────────────────────────────────────
 # BOT SETUP
@@ -329,10 +302,10 @@ class EventSelectView(ui.View):
                 ephemeral=True
             )
 
+# ────────────────────────────────────────────────
+# ASSIGNMENT SELECT VIEW FOR FETCH
+# ────────────────────────────────────────────────
 
-# ────────────────────────────────────────────────
-# ASSIGNMENT SELECT VIEW
-# ────────────────────────────────────────────────
 
 class AssignmentSelectView(ui.View):
     def __init__(self, assignments_list: list[tuple[str, dict]]):
@@ -382,10 +355,10 @@ class AssignmentSelectView(ui.View):
 
         await interaction.response.send_message(embed=embed, files=files)
 
+# ────────────────────────────────────────────────
+# NOTES SELECT VIEWS FOR /fetch-notes
+# ────────────────────────────────────────────────
 
-# ────────────────────────────────────────────────
-# NOTES VIEWS + /fetch-notes
-# ────────────────────────────────────────────────
 
 class SubjectSelectView(ui.View):
     def __init__(self, subjects: list[str]):
@@ -457,22 +430,25 @@ class NoteSelectView(ui.View):
         embed.add_field(
             name="Files", value=f"{len(file_paths)} file(s)", inline=True)
 
-        # Clean up original message by removing view only
         await interaction.message.edit(view=None)
-
-        # Send the note content
         await interaction.response.send_message(embed=embed, files=files)
 
+# ────────────────────────────────────────────────
+# MODAL & VIEW FOR NOTES
+# ────────────────────────────────────────────────
 
-# ────────────────────────────────────────────────
-# MODALS & VIEWS FOR NOTES
-# ────────────────────────────────────────────────
 
 class NoteCreateModal(ui.Modal, title="Create New Note"):
     note_title = ui.TextInput(
-        label="Title", placeholder="e.g. Math Notes Chapter 1", required=True)
+        label="Title",
+        placeholder="e.g. Math Notes Chapter 1",
+        required=True
+    )
     note_subject = ui.TextInput(
-        label="Subject", placeholder="e.g. Math", required=True)
+        label="Subject",
+        placeholder="e.g. Math",
+        required=True
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         title = self.note_title.value.strip()
@@ -544,10 +520,111 @@ class NoteAssignView(ui.View):
             view=None
         )
 
+# ────────────────────────────────────────────────
+# NEW MODAL & VIEW FOR ASSIGNMENTS (similar to notes)
+# ────────────────────────────────────────────────
+
+
+class AssignmentCreateModal(ui.Modal, title="Create New Assignment"):
+    title_input = ui.TextInput(
+        label="Title", placeholder="e.g. Math Homework #3", required=True)
+    description_input = ui.TextInput(
+        label="Description", style=discord.TextStyle.paragraph, required=False)
+    deadline_input = ui.TextInput(
+        label="Deadline (YYYY-MM-DD HH:MM)", placeholder="2025-12-31 23:59", required=True)
+    subject_input = ui.TextInput(
+        label="Subject", placeholder="e.g. Math", required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        title = self.title_input.value.strip()
+        description = self.description_input.value.strip()
+        deadline = self.deadline_input.value.strip()
+        subject = self.subject_input.value.strip()
+
+        try:
+            dt = datetime.strptime(deadline, "%Y-%m-%d %H:%M")
+            if dt <= datetime.now():
+                await interaction.response.send_message("Deadline must be in the future.", ephemeral=True)
+                return
+            deadline_str = dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            await interaction.response.send_message("Invalid deadline format. Use YYYY-MM-DD HH:MM.", ephemeral=True)
+            return
+
+        guild_id = str(interaction.guild_id)
+        assignments = await load_json(ASSIGNMENTS_FILE)
+        assignments.setdefault(guild_id, {})
+
+        assignment_id = str(uuid.uuid4())
+        assignments[guild_id][assignment_id] = {
+            'title': title,
+            'description': description,
+            'deadline': deadline_str,
+            'subject': subject,
+            'file_paths': [],
+            'creator_id': str(interaction.user.id)
+        }
+        await save_json(ASSIGNMENTS_FILE, assignments)
+
+        await interaction.response.send_message(
+            f"Assignment '**{title}**' created under **{subject}** with deadline {deadline_str}.",
+            ephemeral=False
+        )
+
+
+class AssignmentAssignView(ui.View):
+    def __init__(self, assignments_list: list[tuple[str, dict]], temp_paths: list[str]):
+        super().__init__(timeout=180.0)
+        self.temp_paths = temp_paths
+
+        options = []
+        for aid, data in assignments_list:
+            label = f"{data['subject']} - {data['title']} ({aid[:8]}) - Due {data['deadline']}"
+            options.append(SelectOption(label=label[:100], value=aid))
+
+        self.select = ui.Select(
+            placeholder="Select assignment to assign files...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.callback
+        self.add_item(self.select)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_id = self.select.values[0]
+        assignments = await load_json(ASSIGNMENTS_FILE)
+        guild_id = str(interaction.guild_id)
+
+        if guild_id not in assignments or selected_id not in assignments[guild_id]:
+            await interaction.response.send_message("Assignment not found.", ephemeral=True)
+            return
+
+        assign = assignments[guild_id][selected_id]
+        subject = assign['subject']
+        assets_dir = Path("assets/assignments") / subject.replace(" ", "_")
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        new_paths = []
+
+        for temp_path_str in self.temp_paths:
+            temp_path = Path(temp_path_str)
+            if temp_path.exists():
+                new_path = assets_dir / temp_path.name
+                temp_path.rename(new_path)
+                new_paths.append(str(new_path))
+
+        assign['file_paths'].extend(new_paths)
+        await save_json(ASSIGNMENTS_FILE, assignments)
+
+        await interaction.response.edit_message(
+            content=f"Added {len(new_paths)} file(s) to assignment '**{assign['title']}**'.",
+            view=None
+        )
 
 # ────────────────────────────────────────────────
 # WEB SERVER
 # ────────────────────────────────────────────────
+
 
 async def handle_assignment_upload(request):
     if not DEFAULT_GUILD_ID:
@@ -699,10 +776,10 @@ async def start_web():
     await site.start()
     print("[WEB] Web server started at http://localhost:8080/assignments and http://localhost:8080/notes")
 
-
 # ────────────────────────────────────────────────
 # SLASH COMMANDS
 # ────────────────────────────────────────────────
+
 
 @tree.command(name="create-notes", description="Create a new note")
 async def cmd_create_notes(interaction: discord.Interaction):
@@ -768,6 +845,75 @@ async def cmd_load_notes(interaction: discord.Interaction):
     await interaction.followup.send(
         f"Uploaded **{len(temp_paths)}** file(s).\n"
         "Select which note these files belong to:",
+        view=view,
+        ephemeral=False
+    )
+
+
+@tree.command(name="create-assignment", description="Create a new assignment")
+async def cmd_create_assignment(interaction: discord.Interaction):
+    await interaction.response.send_modal(AssignmentCreateModal())
+
+
+@tree.command(name="load-assignment", description="Upload files to an existing assignment")
+async def cmd_load_assignment(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    assignments = await load_json(ASSIGNMENTS_FILE)
+
+    if guild_id not in assignments or not assignments[guild_id]:
+        await interaction.response.send_message(
+            "No assignments found. Create one first with `/create-assignment`.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        "Please reply to **this message** with your file attachments.\n"
+        "(You can attach multiple files in one message)",
+        ephemeral=False
+    )
+
+    initial_msg = await interaction.original_response()
+
+    def check(m: discord.Message):
+        return (
+            m.author.id == interaction.user.id
+            and m.reference is not None
+            and m.reference.message_id == initial_msg.id
+        )
+
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=300.0)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("Upload timed out (5 minutes).", ephemeral=True)
+        return
+
+    if not msg.attachments:
+        await interaction.followup.send("No files were attached in your reply.", ephemeral=True)
+        return
+
+    temp_dir = Path("assets/assignments/temp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_paths = []
+
+    for att in msg.attachments:
+        temp_path = temp_dir / att.filename
+        await att.save(temp_path)
+        temp_paths.append(str(temp_path))
+
+    assign_list = [(aid, data) for aid, data in assignments[guild_id].items()]
+
+    if not assign_list:
+        for p in temp_paths:
+            Path(p).unlink(missing_ok=True)
+        await interaction.followup.send("No assignments available to assign to.", ephemeral=True)
+        return
+
+    view = AssignmentAssignView(assign_list, temp_paths)
+
+    await interaction.followup.send(
+        f"Uploaded **{len(temp_paths)}** file(s).\n"
+        "Select which assignment these files belong to:",
         view=view,
         ephemeral=False
     )
