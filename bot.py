@@ -16,6 +16,7 @@ from aiohttp import web
 import firebase_admin
 from firebase_admin import credentials, firestore
 import math
+import random
 
 # ────────────────────────────────────────────────
 # ENV
@@ -1393,6 +1394,100 @@ async def cmd_check_attendance(interaction: discord.Interaction):
         text="Data fetched from Firebase. Legend: Red=Absent, Blue=Present, Yellow=OD, Purple=Holiday (not tracked here)")
 
     await interaction.followup.send(embed=embed)
+
+import random
+
+@tree.command(name="soonambedu", description="Sends a random picture from the Soonambedu collection")
+async def cmd_soonambedu(interaction: discord.Interaction):
+    folder = Path("assets/soonambedu")
+    
+    if not folder.exists() or not folder.is_dir():
+        await interaction.response.send_message(
+            "The Soonambedu folder doesn't exist yet! Please create `assets/soonambedu/` and add some images.",
+            ephemeral=True
+        )
+        return
+
+    # Supported image extensions
+    image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+
+    # Get all image files
+    images = [
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in image_extensions
+    ]
+
+    if not images:
+        await interaction.response.send_message(
+            "No images found in `assets/soonambedu/`. Please add some .png, .jpg, .jpeg, .gif or .webp files.",
+            ephemeral=True
+        )
+        return
+
+    # Pick random image
+    chosen_image = random.choice(images)
+
+    # Create discord.File object
+    file = discord.File(chosen_image, filename=chosen_image.name)
+
+    # Optional: nice embed
+    embed = discord.Embed(
+        title="Soonambedu Moment ✨",
+        description="Here's a random memory from the collection 🖼️",
+        color=0xe67e22  # warm orange-ish color
+    )
+    embed.set_image(url=f"attachment://{chosen_image.name}")
+    embed.set_footer(text="Use /soonambedu again for another one!")
+
+    await interaction.response.send_message(embed=embed, file=file)
+
+
+@tree.command(name="diddyfrancis", description="Sends a random picture of/related to Shyam Francis")
+async def cmd_diddyfrancis(interaction: discord.Interaction):
+    folder = Path("assets/shyam")
+
+    if not folder.exists() or not folder.is_dir():
+        await interaction.response.send_message(
+            "The Shyam Francis folder doesn't exist yet!\n"
+            "Please create the folder `assets/shyam/` and put some images in it.",
+            ephemeral=True
+        )
+        return
+
+    # Supported image extensions
+    image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+
+    # Collect all valid image files
+    images = [
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in image_extensions
+    ]
+
+    if not images:
+        await interaction.response.send_message(
+            "No images found in `assets/shyam/`.\n"
+            "Please add some .png, .jpg, .jpeg, .gif or .webp files.",
+            ephemeral=True
+        )
+        return
+
+    # Choose one randomly
+    chosen_image = random.choice(images)
+
+    # Prepare file attachment
+    file = discord.File(chosen_image, filename=chosen_image.name)
+
+    # Nice embed presentation
+    embed = discord.Embed(
+        title="Diddy Francis Moment 🐐",
+        description="Random Shyam Francis energy incoming...",
+        color=0x9b59b6  # nice purple-ish vibe
+    )
+    embed.set_image(url=f"attachment://{chosen_image.name}")
+    embed.set_footer(
+        text="Run /diddyfrancis again for more legendary content 🔥")
+
+    await interaction.response.send_message(embed=embed, file=file)
 
 # ────────────────────────────────────────────────
 # EVENTS
