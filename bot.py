@@ -88,7 +88,7 @@ async def save_json(path, data):
         temp.replace(path)
 
 # ────────────────────────────────────────────────
-# LAB MANUALS DIRECTORY — THIS WAS MISSING!
+# LAB MANUALS DIRECTORY
 # ────────────────────────────────────────────────
 LAB_MANUALS_DIR = Path("lab-manuals")
 LAB_MANUALS_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,13 +105,11 @@ tree = bot.tree
 # ────────────────────────────────────────────────
 # FIREBASE SETUP
 # ────────────────────────────────────────────────
-# Assume service_account.json is downloaded from Firebase and placed in the root directory
 SERVICE_ACCOUNT_PATH = 'aids-attendance-system-firebase-adminsdk.json'
 cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Students list from the HTML
 students = [
     {"reg": '2117240070256', "name": 'Ritesh M S'},
     {"reg": '2117240070291', "name": 'Shanjithkrishna V'},
@@ -121,8 +119,6 @@ students = [
     {"reg": '2117240070306', "name": 'Shylendhar M'},
     {"reg": '2117240070308', "name": 'Sidharth P L'}
 ]
-
-# Function to fetch attendance data (sync)
 
 
 def get_attendance_data(reg):
@@ -180,10 +176,13 @@ def get_attendance_data(reg):
 
 
 # ────────────────────────────────────────────────
-# EVENT REMINDER GLOBALS
+# EVENT & CALL GLOBALS
 # ────────────────────────────────────────────────
 active_reminders = {}
 scheduled_tasks = {}
+
+active_calls = {}
+scheduled_call_tasks = {}
 
 
 def schedule_spam(guild_id: str, event_id: str, event: dict):
@@ -225,10 +224,48 @@ def schedule_spam(guild_id: str, event_id: str, event: dict):
     task = asyncio.create_task(inner())
     scheduled_tasks.setdefault(guild_id, {})[event_id] = task
 
-# ────────────────────────────────────────────────
-# EVENT VIEWS (unchanged)
-# ────────────────────────────────────────────────
 
+def schedule_call(guild_id: str, call_id: str, call_data: dict):
+    async def inner():
+        try:
+            # Wait the requested delay
+            await asyncio.sleep(call_data['delay_minutes'] * 60)
+
+            channel = bot.get_channel(call_data['channel_id'])
+            if not channel:
+                return
+
+            active_calls.setdefault(guild_id, {})[call_id] = {
+                'remaining': call_data['members'][:],
+                'channel': channel,
+                'message': call_data.get('message', 'Urgent Call')
+            }
+
+            while len(active_calls[guild_id][call_id]['remaining']) > 0:
+                remaining = active_calls[guild_id][call_id]['remaining']
+                mentions = ' '.join(f"<@{uid}>" for uid in remaining)
+                await channel.send(f"📞 **CALL ALERT** 📞 {call_data.get('message', '')}\n{mentions}")
+                await asyncio.sleep(2)  # spam every 2 seconds
+
+            # Cleanup when everyone has stopped
+            active_calls[guild_id].pop(call_id, None)
+            if not active_calls[guild_id]:
+                active_calls.pop(guild_id, None)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Call spam error for {call_id}: {e}")
+        finally:
+            scheduled_call_tasks.get(guild_id, {}).pop(call_id, None)
+
+    task = asyncio.create_task(inner())
+    scheduled_call_tasks.setdefault(guild_id, {})[call_id] = task
+
+
+# ────────────────────────────────────────────────
+# EVENT VIEWS
+# ────────────────────────────────────────────────
 
 class EventScheduleView(ui.View):
     def __init__(self, event_id: str, title: str):
@@ -391,10 +428,10 @@ class EventSelectView(ui.View):
                 ephemeral=True
             )
 
-# ────────────────────────────────────────────────
-# ASSIGNMENT SELECT VIEW FOR FETCH
-# ────────────────────────────────────────────────
 
+# ────────────────────────────────────────────────
+# ASSIGNMENT SELECT VIEW
+# ────────────────────────────────────────────────
 
 class AssignmentSelectView(ui.View):
     def __init__(self, assignments_list: list[tuple[str, dict]]):
@@ -444,10 +481,10 @@ class AssignmentSelectView(ui.View):
 
         await interaction.response.send_message(embed=embed, files=files)
 
-# ────────────────────────────────────────────────
-# NOTES SELECT VIEWS FOR /fetch-notes
-# ────────────────────────────────────────────────
 
+# ────────────────────────────────────────────────
+# NOTES SELECT VIEWS
+# ────────────────────────────────────────────────
 
 class SubjectSelectView(ui.View):
     def __init__(self, subjects: list[str]):
@@ -700,10 +737,10 @@ class AssignmentAssignView(ui.View):
             view=None
         )
 
+
 # ────────────────────────────────────────────────
 # LAB MANUAL COMMANDS
 # ────────────────────────────────────────────────
-
 
 @tree.command(name="add-lab-manual", description="Create a new lab manual subject folder")
 @app_commands.describe(subject="Name of the lab/subject (e.g. Data Structures Lab)")
@@ -758,7 +795,6 @@ async def cmd_fetch_lab_manual(interaction: discord.Interaction):
             self.add_item(subject_select)
 
         async def on_subject_select(self, inter: discord.Interaction):
-            # cleaned name (with underscores)
             folder_name = inter.data["values"][0]
             subject_path = LAB_MANUALS_DIR / folder_name
 
@@ -818,10 +854,11 @@ async def cmd_fetch_lab_manual(interaction: discord.Interaction):
 
     view = SubjectDropdown()
     await interaction.response.send_message("Select lab manual subject:", view=view, ephemeral=False)
+
+
 # ────────────────────────────────────────────────
 # WEB SERVER
 # ────────────────────────────────────────────────
-
 
 async def handle_assignment_upload(request):
     if not DEFAULT_GUILD_ID:
@@ -973,10 +1010,10 @@ async def start_web():
     await site.start()
     print("[WEB] Web server started at http://localhost:8080/assignments and http://localhost:8080/notes")
 
+
 # ────────────────────────────────────────────────
 # SLASH COMMANDS
 # ────────────────────────────────────────────────
-
 
 @tree.command(name="create-notes", description="Create a new note")
 async def cmd_create_notes(interaction: discord.Interaction):
@@ -1395,12 +1432,11 @@ async def cmd_check_attendance(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed)
 
-import random
 
 @tree.command(name="soonambedu", description="Sends a random picture from the Soonambedu collection")
 async def cmd_soonambedu(interaction: discord.Interaction):
     folder = Path("assets/soonambedu")
-    
+
     if not folder.exists() or not folder.is_dir():
         await interaction.response.send_message(
             "The Soonambedu folder doesn't exist yet! Please create `assets/soonambedu/` and add some images.",
@@ -1408,10 +1444,8 @@ async def cmd_soonambedu(interaction: discord.Interaction):
         )
         return
 
-    # Supported image extensions
     image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
 
-    # Get all image files
     images = [
         f for f in folder.iterdir()
         if f.is_file() and f.suffix.lower() in image_extensions
@@ -1419,22 +1453,18 @@ async def cmd_soonambedu(interaction: discord.Interaction):
 
     if not images:
         await interaction.response.send_message(
-            "No images found in `assets/soonambedu/`. Please add some .png, .jpg, .jpeg, .gif or .webp files.",
+            "No images found in `assets/soonambedu/`. Please add some images.",
             ephemeral=True
         )
         return
 
-    # Pick random image
     chosen_image = random.choice(images)
-
-    # Create discord.File object
     file = discord.File(chosen_image, filename=chosen_image.name)
 
-    # Optional: nice embed
     embed = discord.Embed(
         title="Soonambedu Moment ✨",
         description="Here's a random memory from the collection 🖼️",
-        color=0xe67e22  # warm orange-ish color
+        color=0xe67e22
     )
     embed.set_image(url=f"attachment://{chosen_image.name}")
     embed.set_footer(text="Use /soonambedu again for another one!")
@@ -1454,10 +1484,8 @@ async def cmd_diddyfrancis(interaction: discord.Interaction):
         )
         return
 
-    # Supported image extensions
     image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
 
-    # Collect all valid image files
     images = [
         f for f in folder.iterdir()
         if f.is_file() and f.suffix.lower() in image_extensions
@@ -1466,22 +1494,18 @@ async def cmd_diddyfrancis(interaction: discord.Interaction):
     if not images:
         await interaction.response.send_message(
             "No images found in `assets/shyam/`.\n"
-            "Please add some .png, .jpg, .jpeg, .gif or .webp files.",
+            "Please add some images.",
             ephemeral=True
         )
         return
 
-    # Choose one randomly
     chosen_image = random.choice(images)
-
-    # Prepare file attachment
     file = discord.File(chosen_image, filename=chosen_image.name)
 
-    # Nice embed presentation
     embed = discord.Embed(
         title="Diddy Francis Moment 🐐",
         description="Random Shyam Francis energy incoming...",
-        color=0x9b59b6  # nice purple-ish vibe
+        color=0x9b59b6
     )
     embed.set_image(url=f"attachment://{chosen_image.name}")
     embed.set_footer(
@@ -1489,10 +1513,95 @@ async def cmd_diddyfrancis(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, file=file)
 
+
 # ────────────────────────────────────────────────
-# EVENTS
+# NEW CALL COMMANDS
 # ────────────────────────────────────────────────
 
+@tree.command(name="call", description="Start calling mentioned members after a delay (spams every 2 seconds)")
+@app_commands.describe(
+    delay_minutes="How many minutes to wait before starting the call spam",
+    members="Mention the people to call (@user1 @user2 ...)",
+    message="Optional message to show in the spam (default: Urgent Call)"
+)
+async def cmd_call(interaction: discord.Interaction, delay_minutes: int, members: str, message: str = None):
+    if delay_minutes < 1:
+        await interaction.response.send_message("Delay must be at least 1 minute.", ephemeral=True)
+        return
+
+    member_ids = re.findall(r'<@!?(\d+)>', members)
+    if not member_ids:
+        await interaction.response.send_message("No valid members mentioned.", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild_id)
+    call_id = str(uuid.uuid4())
+
+    call_data = {
+        'members': member_ids,
+        'delay_minutes': delay_minutes,
+        'channel_id': interaction.channel_id,
+        'message': message or "Urgent Call",
+        'creator_id': str(interaction.user.id)
+    }
+
+    schedule_call(guild_id, call_id, call_data)
+
+    mentions_str = ' '.join(f'<@{mid}>' for mid in member_ids)
+
+    await interaction.response.send_message(
+        f"📞 **Mass call scheduled** in **{delay_minutes} minute(s)**!\n"
+        f"Members: {mentions_str}\n"
+        f"Message: {call_data['message']}\n\n"
+        "They will be pinged every **2 seconds** until they use `/stop-calling`",
+        ephemeral=False
+    )
+
+
+@tree.command(name="stop-calling", description="Stop being called / remove yourself from active call spam")
+async def cmd_stop_calling(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    user_id = str(interaction.user.id)
+
+    if guild_id not in active_calls or not active_calls[guild_id]:
+        await interaction.response.send_message("No active calls are running for you right now.", ephemeral=True)
+        return
+
+    stopped_any = False
+    cleared_calls = []
+
+    for call_id, data in list(active_calls[guild_id].items()):
+        if user_id in data['remaining']:
+            data['remaining'].remove(user_id)
+            stopped_any = True
+
+            if len(data['remaining']) == 0:
+                cleared_calls.append(data.get('message', 'Call'))
+
+                if guild_id in scheduled_call_tasks and call_id in scheduled_call_tasks[guild_id]:
+                    scheduled_call_tasks[guild_id][call_id].cancel()
+                    del scheduled_call_tasks[guild_id][call_id]
+
+                del active_calls[guild_id][call_id]
+
+    if guild_id in active_calls and not active_calls[guild_id]:
+        del active_calls[guild_id]
+
+    if not stopped_any:
+        await interaction.response.send_message("You weren't in any active call spam lists.", ephemeral=True)
+        return
+
+    reply = "✅ You have been removed from the calling list."
+
+    if cleared_calls:
+        reply += f"\n\n**Call fully stopped (everyone responded):** {', '.join(cleared_calls)}"
+
+    await interaction.response.send_message(reply, ephemeral=False)
+
+
+# ────────────────────────────────────────────────
+# BOT EVENTS
+# ────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
@@ -1503,6 +1612,7 @@ async def on_ready():
     except Exception as e:
         print(f"Sync failed: {e}")
 
+    # Restore scheduled event reminders
     events = await load_json(EVENTS_FILE)
     for guild_id in events:
         for event_id, event in events[guild_id].items():
@@ -1523,8 +1633,6 @@ async def on_message(message):
         return
 
     if bot.user not in message.mentions:
-        text = re.sub(rf"<@!?{bot.user.id}>", "", message.content).strip()
-        # Your JOI / profile / questionnaire logic here
         await bot.process_commands(message)
         return
 
@@ -1533,21 +1641,19 @@ async def on_message(message):
 
     stopped_any = False
 
+    # Check event reminders
     if guild_id in active_reminders:
         for event_id, data in list(active_reminders[guild_id].items()):
             if user_id in data['remaining']:
                 data['remaining'].remove(user_id)
                 stopped_any = True
 
-    if stopped_any:
-        await message.reply(
-            "Removed you from reminder list(s). Use `/stop-reminder` for more control.",
-            delete_after=15
-        )
+    # You can also add call stopping logic here if you want mentions to stop calls too
 
     await bot.process_commands(message)
 
+
 # ────────────────────────────────────────────────
-# RUN
+# START BOT
 # ────────────────────────────────────────────────
 bot.run(DISCORD_BOT_TOKEN)
