@@ -58,11 +58,12 @@ EVENTS_FILE = DATA_DIR / "events.json"
 ASSIGNMENTS_FILE = DATA_DIR / "assignments.json"
 NOTES_FILE = DATA_DIR / "notes.json"
 REGISTRATIONS_FILE = DATA_DIR / "registrations.json"
-TODO_FILE = DATA_DIR / "todo.json"           # ← NEW
+TODO_FILE = DATA_DIR / "todo.json"
+REMINDERS_FILE = DATA_DIR / "reminders.json"           # ← NEW
 
 DATA_DIR.mkdir(exist_ok=True)
 
-for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE, REGISTRATIONS_FILE, TODO_FILE):
+for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE, REGISTRATIONS_FILE, TODO_FILE, REMINDERS_FILE):
     if not f.exists():
         f.write_text("{}", encoding="utf-8")
 
@@ -177,13 +178,15 @@ def get_attendance_data(reg):
 
 
 # ────────────────────────────────────────────────
-# EVENT & CALL GLOBALS
+# EVENT & CALL & REMINDER GLOBALS
 # ────────────────────────────────────────────────
 active_reminders = {}
 scheduled_tasks = {}
 
 active_calls = {}
 scheduled_call_tasks = {}
+
+scheduled_reminder_tasks = {}   # ← NEW
 
 
 def schedule_spam(guild_id: str, event_id: str, event: dict):
@@ -260,6 +263,50 @@ def schedule_call(guild_id: str, call_id: str, call_data: dict):
 
     task = asyncio.create_task(inner())
     scheduled_call_tasks.setdefault(guild_id, {})[call_id] = task
+
+
+def schedule_reminder(guild_id: str, reminder_id: str, reminder: dict):
+    async def inner():
+        try:
+            dt = datetime.fromisoformat(reminder['datetime'])
+            now = datetime.now()
+            if dt <= now:
+                return
+
+            delay = (dt - now).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            channel = bot.get_channel(reminder['channel_id'])
+            if not channel:
+                return
+
+            await channel.send(
+                f"🔔 **Reminder!** 🔔\n"
+                f"**{reminder['title']}**\n"
+                f"||@everyone||"
+            )
+
+            # Clean up after firing
+            if guild_id in scheduled_reminder_tasks and reminder_id in scheduled_reminder_tasks[guild_id]:
+                scheduled_reminder_tasks[guild_id].pop(reminder_id, None)
+
+            reminders = await load_json(REMINDERS_FILE)
+            if guild_id in reminders and reminder_id in reminders[guild_id]:
+                del reminders[guild_id][reminder_id]
+                if not reminders[guild_id]:
+                    del reminders[guild_id]
+                await save_json(REMINDERS_FILE, reminders)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Reminder error {reminder_id}: {e}")
+        finally:
+            scheduled_reminder_tasks.get(guild_id, {}).pop(reminder_id, None)
+
+    task = asyncio.create_task(inner())
+    scheduled_reminder_tasks.setdefault(guild_id, {})[reminder_id] = task
 
 
 # ────────────────────────────────────────────────
@@ -517,6 +564,149 @@ class EventSelectView(ui.View):
             await interaction.response.send_message(
                 f"Selected for edit: **{title}** (ID: {selected_id[:8]})\n"
                 "(Full edit functionality can be added later)",
+                ephemeral=True
+            )
+
+
+# ────────────────────────────────────────────────
+# REMINDER VIEWS
+# ────────────────────────────────────────────────
+
+class ReminderDateView(ui.View):
+    def __init__(self, reminder_id: str, title: str):
+        super().__init__(timeout=600.0)
+        self.reminder_id = reminder_id
+        self.title = title
+        self.selected_date = None
+
+        now = datetime.now()
+        date_options = []
+        for i in range(10):
+            d = now + timedelta(days=i)
+            label = d.strftime("%Y-%m-%d (%A)")
+            date_options.append(SelectOption(
+                label=label,
+                value=d.strftime("%Y-%m-%d")
+            ))
+
+        self.date_select = ui.Select(
+            placeholder="Select reminder date (fires at 8:00 PM IST)",
+            options=date_options,
+            min_values=1,
+            max_values=1
+        )
+        self.date_select.callback = self.date_callback
+        self.add_item(self.date_select)
+
+        self.confirm_button = ui.Button(
+            label="Confirm & Schedule",
+            style=discord.ButtonStyle.green,
+            disabled=True
+        )
+        self.confirm_button.callback = self.confirm_callback
+        self.add_item(self.confirm_button)
+
+    async def date_callback(self, interaction: discord.Interaction):
+        self.selected_date = self.date_select.values[0]
+        self.confirm_button.disabled = False
+        await interaction.response.edit_message(view=self)
+
+    async def confirm_callback(self, interaction: discord.Interaction):
+        if not self.selected_date:
+            return
+
+        dt_str = f"{self.selected_date} 20:00:00"
+        try:
+            dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+            if dt <= datetime.now():
+                await interaction.response.send_message("Selected date is in the past.", ephemeral=True)
+                return
+        except ValueError:
+            await interaction.response.send_message("Invalid date.", ephemeral=True)
+            return
+
+        reminders = await load_json(REMINDERS_FILE)
+        guild_id = str(interaction.guild_id)
+
+        if guild_id not in reminders or self.reminder_id not in reminders[guild_id]:
+            await interaction.response.send_message("Reminder no longer exists.", ephemeral=True)
+            return
+
+        reminders[guild_id][self.reminder_id]['datetime'] = dt.isoformat()
+        reminders[guild_id][self.reminder_id]['channel_id'] = interaction.channel_id
+        await save_json(REMINDERS_FILE, reminders)
+
+        schedule_reminder(guild_id, self.reminder_id,
+                          reminders[guild_id][self.reminder_id])
+
+        await interaction.response.edit_message(
+            content=f"Reminder '**{self.title}**' scheduled for **{dt.strftime('%Y-%m-%d %I:%M %p')}**",
+            view=None
+        )
+
+
+class ReminderSelectView(ui.View):
+    def __init__(self, reminders_list: list[tuple[str, dict]], action: str):
+        super().__init__(timeout=180.0)
+        self.reminders_list = reminders_list
+        self.action = action
+
+        options = []
+        for rid, data in reminders_list:
+            label = f"{data['title']}"
+            if 'datetime' in data and data['datetime']:
+                try:
+                    dt = datetime.fromisoformat(data['datetime'])
+                    label += f" - {dt.strftime('%Y-%m-%d %I:%M %p')}"
+                except:
+                    pass
+            options.append(SelectOption(label=label[:100], value=rid))
+
+        if not options:
+            self.clear_items()
+            return
+
+        self.select = ui.Select(
+            placeholder=f"Select reminder to {action.replace('_', ' ')}...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.callback
+        self.add_item(self.select)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_id = self.select.values[0]
+        reminders = await load_json(REMINDERS_FILE)
+        guild_id = str(interaction.guild_id)
+
+        if guild_id not in reminders or selected_id not in reminders[guild_id]:
+            await interaction.response.send_message("Reminder not found.", ephemeral=True)
+            return
+
+        reminder = reminders[guild_id][selected_id]
+        title = reminder['title']
+
+        if self.action == "delete":
+            del reminders[guild_id][selected_id]
+            if not reminders[guild_id]:
+                del reminders[guild_id]
+            await save_json(REMINDERS_FILE, reminders)
+
+            if guild_id in scheduled_reminder_tasks and selected_id in scheduled_reminder_tasks[guild_id]:
+                scheduled_reminder_tasks[guild_id][selected_id].cancel()
+                del scheduled_reminder_tasks[guild_id][selected_id]
+
+            await interaction.response.edit_message(
+                content=f"Deleted reminder: **{title}**",
+                view=None
+            )
+
+        elif self.action == "edit":
+            await interaction.response.send_message(
+                f"Selected for edit: **{title}**\n"
+                f"Current time: {reminder.get('datetime', 'Not scheduled')}\n"
+                "(Full edit coming soon – currently only view supported)",
                 ephemeral=True
             )
 
@@ -831,7 +1021,7 @@ class AssignmentAssignView(ui.View):
 
 
 # ────────────────────────────────────────────────
-# HELP COMMAND
+# HELP COMMAND (updated to include new reminder commands)
 # ────────────────────────────────────────────────
 
 @tree.command(name="help", description="Show all available commands and their usage")
@@ -846,6 +1036,9 @@ async def cmd_help(interaction: discord.Interaction):
         ("**/help**", "Shows this help message"),
         ("**/todo**", "Add a new task to the guild todo list"),
         ("**/todo-list**", "View and manage (complete/remove) guild todo tasks"),
+        ("**/set-reminder**", "Create a group reminder that pings @everyone"),
+        ("**/delete-reminder**", "Delete an existing group reminder"),
+        ("**/edit-reminder**", "Edit an existing group reminder (basic)"),
         ("**/create-notes**", "Create a new note entry"),
         ("**/load-notes**", "Upload files → assign them to an existing note"),
         ("**/fetch-notes**", "Browse and download study notes by subject"),
@@ -992,6 +1185,82 @@ async def cmd_fetch_lab_manual(interaction: discord.Interaction):
 
     view = SubjectDropdown()
     await interaction.response.send_message("Select lab manual subject:", view=view, ephemeral=False)
+
+
+# ────────────────────────────────────────────────
+# REMINDER COMMANDS
+# ────────────────────────────────────────────────
+
+@tree.command(name="set-reminder", description="Create a new reminder for the group (pings @everyone)")
+@app_commands.describe(title="Reminder title / message")
+async def cmd_set_reminder(interaction: discord.Interaction, title: str):
+    guild_id = str(interaction.guild_id)
+    reminders = await load_json(REMINDERS_FILE)
+    reminders.setdefault(guild_id, {})
+
+    reminder_id = str(uuid.uuid4())
+    reminders[guild_id][reminder_id] = {
+        'title': title.strip(),
+        'creator_id': str(interaction.user.id),
+        'datetime': None,
+        'channel_id': None
+    }
+    await save_json(REMINDERS_FILE, reminders)
+
+    view = ReminderDateView(reminder_id, title)
+
+    await interaction.response.send_message(
+        f"Reminder **{title}** created.\n"
+        "Please select a date below (will fire at 8:00 PM IST):",
+        view=view,
+        ephemeral=False
+    )
+
+
+@tree.command(name="delete-reminder", description="Delete an existing group reminder")
+async def cmd_delete_reminder(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    reminders = await load_json(REMINDERS_FILE)
+
+    if guild_id not in reminders or not reminders[guild_id]:
+        await interaction.response.send_message("No reminders found in this server.", ephemeral=True)
+        return
+
+    reminder_list = [(rid, data) for rid, data in reminders[guild_id].items()]
+    view = ReminderSelectView(reminder_list, action="delete")
+
+    if not view.children:
+        await interaction.response.send_message("No reminders available to delete.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "Select the reminder you want to **delete**:",
+        view=view,
+        ephemeral=True
+    )
+
+
+@tree.command(name="edit-reminder", description="Edit an existing group reminder (title/date)")
+async def cmd_edit_reminder(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    reminders = await load_json(REMINDERS_FILE)
+
+    if guild_id not in reminders or not reminders[guild_id]:
+        await interaction.response.send_message("No reminders found in this server.", ephemeral=True)
+        return
+
+    reminder_list = [(rid, data) for rid, data in reminders[guild_id].items()]
+    view = ReminderSelectView(reminder_list, action="edit")
+
+    if not view.children:
+        await interaction.response.send_message("No reminders available to edit.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "Select the reminder you want to **edit**:",
+        view=view,
+        ephemeral=True
+    )
 
 
 # ────────────────────────────────────────────────
@@ -1512,7 +1781,7 @@ async def cmd_fetch_assignments(interaction: discord.Interaction):
 async def cmd_timetable(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    image_path = "assets/timetable.png"
+    image_path = "assets/timetable.jpeg"
 
     if not os.path.isfile(image_path):
         await interaction.followup.send(
@@ -1834,6 +2103,18 @@ async def on_ready():
                     dt = datetime.fromisoformat(event['datetime'])
                     if dt > datetime.now():
                         schedule_spam(guild_id, event_id, event)
+                except:
+                    pass
+
+    # Restore scheduled group reminders (the new @everyone ones)
+    reminders = await load_json(REMINDERS_FILE)
+    for guild_id in reminders:
+        for reminder_id, reminder in reminders[guild_id].items():
+            if reminder.get('datetime'):
+                try:
+                    dt = datetime.fromisoformat(reminder['datetime'])
+                    if dt > datetime.now():
+                        schedule_reminder(guild_id, reminder_id, reminder)
                 except:
                     pass
 
