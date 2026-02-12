@@ -1435,49 +1435,73 @@ async def cmd_check_attendance(interaction: discord.Interaction):
 
 @tree.command(name="soonambedu", description="Sends a random picture from the Soonambedu collection")
 async def cmd_soonambedu(interaction: discord.Interaction):
+    await interaction.response.defer()   # ← This is the most important fix
+
     folder = Path("assets/soonambedu")
 
     if not folder.exists() or not folder.is_dir():
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "The Soonambedu folder doesn't exist yet! Please create `assets/soonambedu/` and add some images.",
             ephemeral=True
         )
         return
 
+    # Supported image extensions
     image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
 
+    # Get all image files
     images = [
         f for f in folder.iterdir()
         if f.is_file() and f.suffix.lower() in image_extensions
     ]
 
     if not images:
-        await interaction.response.send_message(
-            "No images found in `assets/soonambedu/`. Please add some images.",
+        await interaction.followup.send(
+            "No images found in `assets/soonambedu/`. Please add some .png, .jpg, .jpeg, .gif or .webp files.",
             ephemeral=True
         )
         return
 
+    # Optional: shuffle once per command invocation for better feeling of randomness
+    random.shuffle(images)   # ← helps when folder has few files
+
+    # Pick one
     chosen_image = random.choice(images)
-    file = discord.File(chosen_image, filename=chosen_image.name)
 
-    embed = discord.Embed(
-        title="Soonambedu Moment ✨",
-        description="Here's a random memory from the collection 🖼️",
-        color=0xe67e22
-    )
-    embed.set_image(url=f"attachment://{chosen_image.name}")
-    embed.set_footer(text="Use /soonambedu again for another one!")
+    try:
+        file = discord.File(chosen_image, filename=chosen_image.name)
 
-    await interaction.response.send_message(embed=embed, file=file)
+        embed = discord.Embed(
+            title="Soonambedu Moment ✨",
+            description="Here's a random memory from the collection 🖼️",
+            color=0xe67e22
+        )
+        embed.set_image(url=f"attachment://{chosen_image.name}")
+        embed.set_footer(text="Use /soonambedu again for another one!")
+
+        await interaction.followup.send(embed=embed, file=file)
+
+    except discord.HTTPException as e:
+        await interaction.followup.send(
+            f"Failed to send image: {e}\n({type(e).__name__})",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            "Something went wrong while preparing/sending the image 😔",
+            ephemeral=True
+        )
+        print(f"[soonambedu error] {type(e).__name__}: {e}")
 
 
 @tree.command(name="diddyfrancis", description="Sends a random picture of/related to Shyam Francis")
 async def cmd_diddyfrancis(interaction: discord.Interaction):
+    await interaction.response.defer()
+
     folder = Path("assets/shyam")
 
     if not folder.exists() or not folder.is_dir():
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "The Shyam Francis folder doesn't exist yet!\n"
             "Please create the folder `assets/shyam/` and put some images in it.",
             ephemeral=True
@@ -1492,27 +1516,43 @@ async def cmd_diddyfrancis(interaction: discord.Interaction):
     ]
 
     if not images:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No images found in `assets/shyam/`.\n"
-            "Please add some images.",
+            "Please add some .png, .jpg, .jpeg, .gif or .webp files.",
             ephemeral=True
         )
         return
 
+    # Shuffle to reduce "same image every time" feeling with small collections
+    random.shuffle(images)
     chosen_image = random.choice(images)
-    file = discord.File(chosen_image, filename=chosen_image.name)
 
-    embed = discord.Embed(
-        title="Diddy Francis Moment 🐐",
-        description="Random Shyam Francis energy incoming...",
-        color=0x9b59b6
-    )
-    embed.set_image(url=f"attachment://{chosen_image.name}")
-    embed.set_footer(
-        text="Run /diddyfrancis again for more legendary content 🔥")
+    try:
+        file = discord.File(chosen_image, filename=chosen_image.name)
 
-    await interaction.response.send_message(embed=embed, file=file)
+        embed = discord.Embed(
+            title="Diddy Francis Moment 🐐",
+            description="Random Shyam Francis energy incoming...",
+            color=0x9b59b6  # nice purple-ish vibe
+        )
+        embed.set_image(url=f"attachment://{chosen_image.name}")
+        embed.set_footer(
+            text="Run /diddyfrancis again for more legendary content 🔥"
+        )
 
+        await interaction.followup.send(embed=embed, file=file)
+
+    except discord.HTTPException as http_err:
+        await interaction.followup.send(
+            f"Discord error while sending: {http_err}",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            "Failed to load/send image 😔",
+            ephemeral=True
+        )
+        print(f"[diddyfrancis] Error: {type(e).__name__} - {e}")
 
 # ────────────────────────────────────────────────
 # NEW CALL COMMANDS
