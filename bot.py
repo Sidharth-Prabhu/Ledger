@@ -58,10 +58,11 @@ EVENTS_FILE = DATA_DIR / "events.json"
 ASSIGNMENTS_FILE = DATA_DIR / "assignments.json"
 NOTES_FILE = DATA_DIR / "notes.json"
 REGISTRATIONS_FILE = DATA_DIR / "registrations.json"
+TODO_FILE = DATA_DIR / "todo.json"           # ← NEW
 
 DATA_DIR.mkdir(exist_ok=True)
 
-for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE, REGISTRATIONS_FILE):
+for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE, REGISTRATIONS_FILE, TODO_FILE):
     if not f.exists():
         f.write_text("{}", encoding="utf-8")
 
@@ -228,7 +229,6 @@ def schedule_spam(guild_id: str, event_id: str, event: dict):
 def schedule_call(guild_id: str, call_id: str, call_data: dict):
     async def inner():
         try:
-            # Wait the requested delay
             await asyncio.sleep(call_data['delay_minutes'] * 60)
 
             channel = bot.get_channel(call_data['channel_id'])
@@ -245,9 +245,8 @@ def schedule_call(guild_id: str, call_id: str, call_data: dict):
                 remaining = active_calls[guild_id][call_id]['remaining']
                 mentions = ' '.join(f"<@{uid}>" for uid in remaining)
                 await channel.send(f"📞 **CALL ALERT** 📞 {call_data.get('message', '')}\n{mentions}")
-                await asyncio.sleep(2)  # spam every 2 seconds
+                await asyncio.sleep(2)
 
-            # Cleanup when everyone has stopped
             active_calls[guild_id].pop(call_id, None)
             if not active_calls[guild_id]:
                 active_calls.pop(guild_id, None)
@@ -261,6 +260,99 @@ def schedule_call(guild_id: str, call_id: str, call_data: dict):
 
     task = asyncio.create_task(inner())
     scheduled_call_tasks.setdefault(guild_id, {})[call_id] = task
+
+
+# ────────────────────────────────────────────────
+# TODO MODAL
+# ────────────────────────────────────────────────
+
+class TodoCreateModal(ui.Modal, title="Add New Todo Task"):
+    task_description = ui.TextInput(
+        label="Task / Todo",
+        placeholder="e.g. Submit math assignment, Revise OS unit 3, Call mom...",
+        required=True,
+        max_length=200
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        task_text = self.task_description.value.strip()
+        if not task_text:
+            await interaction.response.send_message("Task cannot be empty.", ephemeral=True)
+            return
+
+        guild_id = str(interaction.guild_id)
+        todos = await load_json(TODO_FILE)
+        todos.setdefault(guild_id, {})
+
+        task_id = str(uuid.uuid4())
+        todos[guild_id][task_id] = {
+            "text": task_text,
+            "created_by": str(interaction.user.id),
+            "created_at": datetime.now().isoformat()
+        }
+
+        await save_json(TODO_FILE, todos)
+
+        await interaction.response.send_message(
+            f"✅ Todo added: **{task_text}**",
+            ephemeral=False
+        )
+
+
+# ────────────────────────────────────────────────
+# TODO SELECT VIEW (for removal)
+# ────────────────────────────────────────────────
+
+class TodoSelectView(ui.View):
+    def __init__(self, todo_list: list[tuple[str, dict]]):
+        super().__init__(timeout=180.0)
+        self.todo_list = todo_list
+
+        options = []
+        for tid, data in todo_list:
+            label = data["text"][:80]
+            if len(data["text"]) > 80:
+                label += "..."
+            options.append(SelectOption(
+                label=label,
+                value=tid,
+                description=f"Added by <@{data['created_by']}>"
+            ))
+
+        if not options:
+            self.clear_items()
+            return
+
+        self.select = ui.Select(
+            placeholder="Select task to MARK AS DONE / REMOVE...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.callback
+        self.add_item(self.select)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_id = self.select.values[0]
+        guild_id = str(interaction.guild_id)
+        todos = await load_json(TODO_FILE)
+
+        if guild_id not in todos or selected_id not in todos[guild_id]:
+            await interaction.response.send_message("Task no longer exists.", ephemeral=True)
+            return
+
+        task_text = todos[guild_id][selected_id]["text"]
+        del todos[guild_id][selected_id]
+
+        if not todos[guild_id]:
+            del todos[guild_id]
+
+        await save_json(TODO_FILE, todos)
+
+        await interaction.response.edit_message(
+            content=f"🗑️ Task completed / removed:\n**{task_text}**",
+            view=None
+        )
 
 
 # ────────────────────────────────────────────────
@@ -739,6 +831,52 @@ class AssignmentAssignView(ui.View):
 
 
 # ────────────────────────────────────────────────
+# HELP COMMAND
+# ────────────────────────────────────────────────
+
+@tree.command(name="help", description="Show all available commands and their usage")
+async def cmd_help(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="JOI Bot Commands Help",
+        description="Here are all the commands you can use:",
+        color=0x5865F2
+    )
+
+    commands_list = [
+        ("**/help**", "Shows this help message"),
+        ("**/todo**", "Add a new task to the guild todo list"),
+        ("**/todo-list**", "View and manage (complete/remove) guild todo tasks"),
+        ("**/create-notes**", "Create a new note entry"),
+        ("**/load-notes**", "Upload files → assign them to an existing note"),
+        ("**/fetch-notes**", "Browse and download study notes by subject"),
+        ("**/create-assignment**", "Create a new assignment entry"),
+        ("**/load-assignment**", "Upload files → assign to an existing assignment"),
+        ("**/fetch-assignments**", "View and download assignments with files"),
+        ("**/set-event**", "Create a new event with mentioned members"),
+        ("**/delete-event**", "Delete an existing event"),
+        ("**/edit-event**", "Select an event to edit (placeholder)"),
+        ("**/stop-reminder**", "Remove yourself from active event reminders"),
+        ("**/call**", "Schedule mass pings (call spam) after delay"),
+        ("**/stop-calling**", "Remove yourself from active call spam"),
+        ("**/check-attendance**", "Show your attendance stats from Firebase"),
+        ("**/timetable**", "Display your timetable image"),
+        ("**/soonambedu**", "Get a random image from the Soonambedu collection"),
+        ("**/diddyfrancis**", "Get a random Shyam Francis related image"),
+        ("**/add-lab-manual**", "Create a new lab manual subject folder"),
+        ("**/fetch-lab-manual-programs**",
+         "Browse and read lab experiment code files"),
+    ]
+
+    for name, desc in commands_list:
+        embed.add_field(name=name, value=desc, inline=False)
+
+    embed.set_footer(
+        text="JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR")
+
+    await interaction.response.send_message(embed=embed, ephemeral=False)
+
+
+# ────────────────────────────────────────────────
 # LAB MANUAL COMMANDS
 # ────────────────────────────────────────────────
 
@@ -854,6 +992,46 @@ async def cmd_fetch_lab_manual(interaction: discord.Interaction):
 
     view = SubjectDropdown()
     await interaction.response.send_message("Select lab manual subject:", view=view, ephemeral=False)
+
+
+# ────────────────────────────────────────────────
+# TODO COMMANDS
+# ────────────────────────────────────────────────
+
+@tree.command(name="todo", description="Add a new task to the guild's todo list")
+async def cmd_todo(interaction: discord.Interaction):
+    await interaction.response.send_modal(TodoCreateModal())
+
+
+@tree.command(name="todo-list", description="Show and manage the guild's todo list")
+async def cmd_todo_list(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    todos = await load_json(TODO_FILE)
+
+    if guild_id not in todos or not todos[guild_id]:
+        await interaction.response.send_message(
+            "No tasks in the todo list right now 🎉",
+            ephemeral=False
+        )
+        return
+
+    todo_items = [(tid, data) for tid, data in todos[guild_id].items()]
+
+    if not todo_items:
+        await interaction.response.send_message("Todo list is empty.", ephemeral=True)
+        return
+
+    view = TodoSelectView(todo_items)
+
+    if not view.children:  # no items
+        await interaction.response.send_message("No tasks available.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "**Guild To-Do List**\nSelect a task to mark as done / remove it:",
+        view=view,
+        ephemeral=False
+    )
 
 
 # ────────────────────────────────────────────────
@@ -1012,7 +1190,7 @@ async def start_web():
 
 
 # ────────────────────────────────────────────────
-# SLASH COMMANDS
+# SLASH COMMANDS (continued)
 # ────────────────────────────────────────────────
 
 @tree.command(name="create-notes", description="Create a new note")
@@ -1435,7 +1613,7 @@ async def cmd_check_attendance(interaction: discord.Interaction):
 
 @tree.command(name="soonambedu", description="Sends a random picture from the Soonambedu collection")
 async def cmd_soonambedu(interaction: discord.Interaction):
-    await interaction.response.defer()   # ← This is the most important fix
+    await interaction.response.defer()
 
     folder = Path("assets/soonambedu")
 
@@ -1446,10 +1624,8 @@ async def cmd_soonambedu(interaction: discord.Interaction):
         )
         return
 
-    # Supported image extensions
     image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
 
-    # Get all image files
     images = [
         f for f in folder.iterdir()
         if f.is_file() and f.suffix.lower() in image_extensions
@@ -1462,10 +1638,7 @@ async def cmd_soonambedu(interaction: discord.Interaction):
         )
         return
 
-    # Optional: shuffle once per command invocation for better feeling of randomness
-    random.shuffle(images)   # ← helps when folder has few files
-
-    # Pick one
+    random.shuffle(images)
     chosen_image = random.choice(images)
 
     try:
@@ -1523,7 +1696,6 @@ async def cmd_diddyfrancis(interaction: discord.Interaction):
         )
         return
 
-    # Shuffle to reduce "same image every time" feeling with small collections
     random.shuffle(images)
     chosen_image = random.choice(images)
 
@@ -1533,7 +1705,7 @@ async def cmd_diddyfrancis(interaction: discord.Interaction):
         embed = discord.Embed(
             title="Diddy Francis Moment 🐐",
             description="Random Shyam Francis energy incoming...",
-            color=0x9b59b6  # nice purple-ish vibe
+            color=0x9b59b6
         )
         embed.set_image(url=f"attachment://{chosen_image.name}")
         embed.set_footer(
@@ -1553,6 +1725,7 @@ async def cmd_diddyfrancis(interaction: discord.Interaction):
             ephemeral=True
         )
         print(f"[diddyfrancis] Error: {type(e).__name__} - {e}")
+
 
 # ────────────────────────────────────────────────
 # NEW CALL COMMANDS
@@ -1681,14 +1854,11 @@ async def on_message(message):
 
     stopped_any = False
 
-    # Check event reminders
     if guild_id in active_reminders:
         for event_id, data in list(active_reminders[guild_id].items()):
             if user_id in data['remaining']:
                 data['remaining'].remove(user_id)
                 stopped_any = True
-
-    # You can also add call stopping logic here if you want mentions to stop calls too
 
     await bot.process_commands(message)
 
