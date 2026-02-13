@@ -790,15 +790,23 @@ class SubjectSelectView(ui.View):
             await interaction.response.send_message("No notes found.", ephemeral=True)
             return
 
-        subject_notes = [(nid, data) for nid, data in notes[guild_id].items(
-        ) if data['subject'] == subject]
+        subject_notes = [
+            (nid, data) for nid, data in notes[guild_id].items()
+            if data['subject'] == subject
+        ]
 
         if not subject_notes:
-            await interaction.response.send_message(f"No notes in {subject}.", ephemeral=True)
+            await interaction.response.send_message(
+                f"No notes in **{subject}**.", ephemeral=True
+            )
             return
 
         view = NoteSelectView(subject_notes)
-        await interaction.response.edit_message(content=f"Select note from {subject}:", view=view)
+
+        await interaction.response.edit_message(
+            content=f"Select note from **{subject}**:",
+            view=view
+        )
 
 
 class NoteSelectView(ui.View):
