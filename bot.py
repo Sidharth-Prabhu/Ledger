@@ -781,6 +781,7 @@ class SubjectSelectView(ui.View):
         self.select.callback = self.callback
         self.add_item(self.select)
 
+
     async def callback(self, interaction: discord.Interaction):
         subject = self.select.values[0]
         guild_id = str(interaction.guild_id)
@@ -807,8 +808,7 @@ class SubjectSelectView(ui.View):
             content=f"Select note from **{subject}**:",
             view=view
         )
-
-
+    
 class NoteSelectView(ui.View):
     def __init__(self, notes_list: list[tuple[str, dict]]):
         super().__init__(timeout=180.0)
@@ -1076,6 +1076,125 @@ async def cmd_help(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
+# ────────────────────────────────────────────────
+# UPTIME CLI (shows real server uptime)
+# ────────────────────────────────────────────────
+@tree.command(name="uptime-cli", description="Show how long the server has been running (real host uptime)")
+async def cmd_uptime_cli(interaction: discord.Interaction):
+    # Optional: restrict to admin / specific users if desired
+    # if interaction.user.name.lower() != "sidhartheverett":
+    #     await interaction.response.send_message("This command is restricted.", ephemeral=True)
+    #     return
+
+    await interaction.response.defer(ephemeral=False)  # Give us time to run system command
+
+    try:
+        # Run the actual uptime command
+        import subprocess
+        result = subprocess.run(
+            ["uptime"],
+            capture_output=True,
+            text=True,
+            timeout=8
+        )
+
+        if result.returncode != 0:
+            await interaction.followup.send(
+                "Failed to read server uptime.\n"
+                f"Error: {result.stderr.strip() or 'command failed'}",
+                ephemeral=True
+            )
+            return
+
+        raw_output = result.stdout.strip()
+
+        # ────────────────────────────────────────────────
+        # Parse typical uptime output (Linux)
+        # Examples:
+        #  15:42:19 up  5 days,  3:17,  1 user,  load average: 0.12, 0.15, 0.18
+        #  10:05:22 up 12 min,  3 users,  load average: 1.45, 0.92, 0.68
+        # ────────────────────────────────────────────────
+
+        # Basic clean version
+        embed = discord.Embed(
+            title="🖥️ Server Uptime",
+            color=0x00c4b4,
+            timestamp=datetime.utcnow()
+        )
+
+        embed.add_field(
+            name="Uptime Output",
+            value=f"```\n{raw_output}\n```",
+            inline=False
+        )
+
+        # Try to extract nicer fields (optional parsing)
+        try:
+            parts = raw_output.split("up", 1)
+            if len(parts) == 2:
+                time_part = parts[1].strip().split(",", 2)
+                uptime_str = time_part[0].strip()
+                users_load = ", ".join(time_part[1:]).strip() if len(time_part) > 1 else ""
+
+                embed.add_field(name="Running for", value=uptime_str, inline=True)
+                if users_load:
+                    embed.add_field(name="Users / Load", value=users_load, inline=True)
+        except:
+            pass  # fallback to raw if parsing fails
+
+        embed.set_footer(text="Host machine uptime • JOI Bot")
+
+        await interaction.followup.send(embed=embed)
+
+    except FileNotFoundError:
+        await interaction.followup.send(
+            "The `uptime` command is not available on this server.",
+            ephemeral=True
+        )
+    except subprocess.TimeoutExpired:
+        await interaction.followup.send(
+            "Reading uptime timed out.",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"Error while checking uptime:\n```py\n{type(e).__name__}: {str(e)}\n```",
+            ephemeral=True
+        )
+
+# ────────────────────────────────────────────────
+# ADMIN ONLY COMMANDS
+# ────────────────────────────────────────────────
+
+@tree.command(name="admin-announce", description="Send server-wide announcement (admin only)")
+@app_commands.describe(
+    message="The announcement text to send with @everyone"
+)
+async def admin_announce(interaction: discord.Interaction, message: str):
+    if interaction.user.name.lower() != "sidhartheverett":
+        await interaction.response.send_message(
+            "⛔ This command is restricted to **sidhartheverett** only.",
+            ephemeral=True
+        )
+        return
+
+    announcement = message.strip()
+    if not announcement:
+        await interaction.response.send_message("Cannot send empty announcement.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await interaction.channel.send(
+            f"📢 **OFFICIAL ANNOUNCEMENT** 📢\n\n{announcement}\n\n||@everyone||"
+        )
+        await interaction.followup.send(
+            "Announcement posted successfully ✓",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}", ephemeral=True)
 
 # ────────────────────────────────────────────────
 # LAB MANUAL COMMANDS
@@ -1284,32 +1403,49 @@ async def cmd_todo(interaction: discord.Interaction):
 async def cmd_todo_list(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
     todos = await load_json(TODO_FILE)
-
+    
     if guild_id not in todos or not todos[guild_id]:
         await interaction.response.send_message(
-            "No tasks in the todo list right now 🎉",
+            "🎉 The guild to-do list is currently empty!\nAdd something with `/todo`",
             ephemeral=False
         )
         return
 
     todo_items = [(tid, data) for tid, data in todos[guild_id].items()]
-
     if not todo_items:
-        await interaction.response.send_message("Todo list is empty.", ephemeral=True)
+        await interaction.response.send_message("No tasks found.", ephemeral=True)
         return
+
+    # Build embed
+    embed = discord.Embed(
+        title="📋 Guild To-Do List",
+        color=0x5865F2,
+        description="Current pending tasks for the server"
+    )
+
+    for i, (task_id, data) in enumerate(todo_items, 1):
+        created_by = f"<@{data['created_by']}>"
+        created_at = datetime.fromisoformat(data['created_at']).strftime("%b %d, %Y %H:%M")
+        value = f"Added by {created_by} • {created_at}"
+        embed.add_field(
+            name=f"{i}. {data['text']}",
+            value=value,
+            inline=False
+        )
+
+    embed.set_footer(text=f"{len(todo_items)} task{'s' if len(todo_items) != 1 else ''} • Use the menu below to complete tasks")
 
     view = TodoSelectView(todo_items)
 
-    if not view.children:  # no items
-        await interaction.response.send_message("No tasks available.", ephemeral=True)
-        return
+    if not view.children:
+        embed.description = "No tasks available to manage right now."
+        view = None
 
     await interaction.response.send_message(
-        "**Guild To-Do List**\nSelect a task to mark as done / remove it:",
+        embed=embed,
         view=view,
         ephemeral=False
     )
-
 
 # ────────────────────────────────────────────────
 # WEB SERVER
@@ -2156,3 +2292,4 @@ async def on_message(message):
 # START BOT
 # ────────────────────────────────────────────────
 bot.run(DISCORD_BOT_TOKEN)
+
