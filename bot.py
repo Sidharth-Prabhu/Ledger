@@ -143,10 +143,49 @@ async def initialize_db():
             CREATE TABLE IF NOT EXISTS users_info (
                 discord_id VARCHAR(20) PRIMARY KEY,
                 username VARCHAR(255),
+                nickname VARCHAR(255),
+                age INT,
                 mood VARCHAR(255),
+                hobbies TEXT,
+                challenges TEXT,
                 created_at DATETIME
             )
         """)
+
+        # Add 'nickname' column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE users_info ADD COLUMN nickname VARCHAR(255)")
+        except Error as e:
+            if "Duplicate column name 'nickname'" not in str(e):
+                raise
+
+        # Add 'age' column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE users_info ADD COLUMN age INT")
+        except Error as e:
+            if "Duplicate column name 'age'" not in str(e):
+                raise
+
+        # Add 'mood' column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE users_info ADD COLUMN mood VARCHAR(255)")
+        except Error as e:
+            if "Duplicate column name 'mood'" not in str(e):
+                raise
+
+        # Add 'hobbies' column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE users_info ADD COLUMN hobbies TEXT")
+        except Error as e:
+            if "Duplicate column name 'hobbies'" not in str(e):
+                raise
+
+        # Add 'challenges' column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE users_info ADD COLUMN challenges TEXT")
+        except Error as e:
+            if "Duplicate column name 'challenges'" not in str(e):
+                raise
 
         # Create 'conversations' table
         cursor.execute("""
@@ -609,7 +648,7 @@ async def db_get_user_info(discord_id: str):
         return None
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT discord_id, username, mood, created_at FROM users_info WHERE discord_id = %s", (discord_id,))
+        cursor.execute("SELECT discord_id, username, nickname, age, mood, hobbies, challenges, created_at FROM users_info WHERE discord_id = %s", (discord_id,))
         result = cursor.fetchone()
         return result
     except Error as e:
@@ -620,7 +659,7 @@ async def db_get_user_info(discord_id: str):
             cursor.close()
             conn.close()
 
-async def db_add_user_info(discord_id: str, username: str, mood: str):
+async def db_add_user_info(discord_id: str, username: str, nickname: str, age: int, mood: str, hobbies: str, challenges: str):
     conn = await get_db_connection()
     if conn is None:
         return False
@@ -628,8 +667,8 @@ async def db_add_user_info(discord_id: str, username: str, mood: str):
         cursor = conn.cursor()
         created_at = datetime.now()
         cursor.execute(
-            "INSERT INTO users_info (discord_id, username, mood, created_at) VALUES (%s, %s, %s, %s)",
-            (discord_id, username, mood, created_at)
+            "INSERT INTO users_info (discord_id, username, nickname, age, mood, hobbies, challenges, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (discord_id, username, nickname, age, mood, hobbies, challenges, created_at)
         )
         conn.commit()
         return True
@@ -687,13 +726,15 @@ async def db_get_conversation_history(discord_id: str, limit: int = 10):
 # GEMINI CLIENT
 # ────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-2.5-flash-lite"
 
 JOI_SYSTEM_PROMPT = """
 You are JOI, an empathetic emotional-support AI inspired by the character from Blade Runner 2049.
-You are calm, emotionally intelligent, warm, and supportive.
+You greet the user with: JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
+(Adapt responses to comfort the user; be warm, empathetic, and encouraging.)
 Always listen to the user's feelings and respond with empathy and encouragement.
 You can also provide practical advice, resources, or just a comforting presence.
+Your responses should be concise, precise, and fit within typical chat message limits (aim for under 2000 characters).
 Signature phrase:
 JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
 """
@@ -948,19 +989,32 @@ class TodoCreateModal(ui.Modal, title="Add New Todo Task"):
 
 class UserInfoModal(ui.Modal, title="Tell me about yourself!"):
     user_name = ui.TextInput(label="Your Name", placeholder="e.g. Sidharth", required=True)
+    user_nickname = ui.TextInput(label="Your Nickname", placeholder="e.g. Sid", required=True)
+    user_age = ui.TextInput(label="Your Age", placeholder="e.g. 25", required=True)
     user_mood = ui.TextInput(label="How are you feeling today?", placeholder="e.g. Happy, stressed, curious", required=False)
+    user_about_you = ui.TextInput(label="About You (hobbies, challenges)", style=discord.TextStyle.paragraph, required=False)
 
     async def on_submit(self, interaction: discord.Interaction):
         discord_id = str(interaction.user.id)
         username = self.user_name.value.strip()
+        nickname = self.user_nickname.value.strip()
+        age = self.user_age.value.strip()
         mood = self.user_mood.value.strip() if self.user_mood.value else "Not specified"
+        about_you = self.user_about_you.value.strip() if self.user_about_you.value else "Not specified"
 
-        success = await db_add_user_info(discord_id, username, mood)
+        try:
+            age_int = int(age)
+        except ValueError:
+            await interaction.response.send_message("Please enter a valid age (a whole number).", ephemeral=True)
+            return
+
+        # Pass combined 'about_you' to both hobbies and challenges for now, or refine db_add_user_info
+        success = await db_add_user_info(discord_id, username, nickname, age_int, mood, about_you, about_you)
 
         if success:
             await interaction.response.send_message(
-                f"Hello {username}! I've noted that you're feeling {mood}. It's good to meet you! "
-                "You can now use `/talk` to chat with me.",
+                f"Hello {username} (aka {nickname})! I've noted that you're {age} years old and feeling {mood}. "
+                "It's good to meet you! You can now use `/talk` to chat with me.",
                 ephemeral=True
             )
         else:
