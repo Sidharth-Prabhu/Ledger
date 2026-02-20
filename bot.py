@@ -12,6 +12,8 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import google.generativeai as genai
 from aiohttp import web
+import mysql.connector
+from mysql.connector import Error
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -27,17 +29,665 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEFAULT_GUILD_ID = os.getenv("DEFAULT_GUILD_ID")
 
+MYSQL_HOST = os.getenv("MYSQL_HOST")
+MYSQL_USER = os.getenv("MYSQL_USER")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE")
+
 if not DISCORD_BOT_TOKEN or not GEMINI_API_KEY:
     raise RuntimeError("Missing required environment variables")
 
 if not DEFAULT_GUILD_ID:
     print("[WARN] DEFAULT_GUILD_ID not set in .env → web uploads will fail")
 
+if not all([MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE]):
+    raise RuntimeError("Missing one or more MySQL environment variables: MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE")
+
+# ────────────────────────────────────────────────
+# DATABASE CONNECTION
+# ────────────────────────────────────────────────
+async def get_db_connection():
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE
+        )
+        return conn
+    except Error as e:
+        print(f"Error connecting to MySQL database: {e}")
+        return None
+
+async def initialize_db():
+    conn = await get_db_connection()
+    if conn is None:
+        print("Failed to initialize database: No connection.")
+        return
+
+    try:
+        cursor = conn.cursor()
+
+        # Create 'events' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                event_id VARCHAR(36) PRIMARY KEY,
+                guild_id VARCHAR(20),
+                title VARCHAR(255),
+                members TEXT,
+                creator_id VARCHAR(20),
+                datetime DATETIME,
+                channel_id VARCHAR(20)
+            )
+        """)
+
+        # Create 'assignments' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS assignments (
+                assignment_id VARCHAR(36) PRIMARY KEY,
+                guild_id VARCHAR(20),
+                title VARCHAR(255),
+                description TEXT,
+                deadline DATETIME,
+                subject VARCHAR(100),
+                file_paths TEXT,
+                creator_id VARCHAR(20)
+            )
+        """)
+
+        # Create 'notes' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                note_id VARCHAR(36) PRIMARY KEY,
+                guild_id VARCHAR(20),
+                title VARCHAR(255),
+                subject VARCHAR(100),
+                file_paths TEXT,
+                creator_id VARCHAR(20)
+            )
+        """)
+
+        # Create 'registrations' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS registrations (
+                username VARCHAR(255) PRIMARY KEY,
+                reg_number VARCHAR(20)
+            )
+        """)
+
+        # Create 'todos' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS todos (
+                task_id VARCHAR(36) PRIMARY KEY,
+                guild_id VARCHAR(20),
+                text TEXT,
+                created_by VARCHAR(20),
+                created_at DATETIME
+            )
+        """)
+
+        # Create 'reminders' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                reminder_id VARCHAR(36) PRIMARY KEY,
+                guild_id VARCHAR(20),
+                title VARCHAR(255),
+                creator_id VARCHAR(20),
+                datetime DATETIME,
+                channel_id VARCHAR(20)
+            )
+        """)
+
+        # Create 'users_info' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users_info (
+                discord_id VARCHAR(20) PRIMARY KEY,
+                username VARCHAR(255),
+                mood VARCHAR(255),
+                created_at DATETIME
+            )
+        """)
+
+        # Create 'conversations' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                conversation_id VARCHAR(36) PRIMARY KEY,
+                discord_id VARCHAR(20),
+                timestamp DATETIME,
+                user_message TEXT,
+                bot_response TEXT
+            )
+        """)
+        conn.commit()
+        print("MySQL database tables initialized successfully.")
+
+    except Error as e:
+        print(f"Error initializing database tables: {e}")
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# ────────────────────────────────────────────────
+# DATABASE REMINDERS FUNCTIONS
+# ────────────────────────────────────────────────
+async def db_get_reminders(guild_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT reminder_id, title, creator_id, datetime, channel_id FROM reminders WHERE guild_id = %s", (guild_id,))
+        reminders_data = cursor.fetchall()
+        return [
+            {
+                "reminder_id": r["reminder_id"],
+                "title": r["title"],
+                "creator_id": r["creator_id"],
+                "datetime": r["datetime"].isoformat() if r["datetime"] else None,
+                "channel_id": int(r["channel_id"]) if r["channel_id"] else None,
+            }
+            for r in reminders_data
+        ]
+    except Error as e:
+        print(f"Error getting reminders: {e}")
+        return []
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_add_reminder(guild_id: str, reminder_id: str, title: str, creator_id: str, datetime_obj: datetime, channel_id: int):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO reminders (reminder_id, guild_id, title, creator_id, datetime, channel_id) VALUES (%s, %s, %s, %s, %s, %s)",
+            (reminder_id, guild_id, title, creator_id, datetime_obj, str(channel_id))
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error adding reminder: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_delete_reminder(guild_id: str, reminder_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM reminders WHERE guild_id = %s AND reminder_id = %s", (guild_id, reminder_id))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Error as e:
+        print(f"Error deleting reminder: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_update_reminder_datetime(guild_id: str, reminder_id: str, datetime_obj: datetime, channel_id: int):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE reminders SET datetime = %s, channel_id = %s WHERE guild_id = %s AND reminder_id = %s",
+            (datetime_obj, str(channel_id), guild_id, reminder_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Error as e:
+        print(f"Error updating reminder datetime: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# ────────────────────────────────────────────────
+# DATABASE TODO FUNCTIONS
+# ────────────────────────────────────────────────
+async def db_get_todos(guild_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT task_id, text, created_by, created_at FROM todos WHERE guild_id = %s", (guild_id,))
+        todos_data = cursor.fetchall()
+        return [
+            {
+                "task_id": t["task_id"],
+                "text": t["text"],
+                "created_by": t["created_by"],
+                "created_at": t["created_at"].isoformat(),
+            }
+            for t in todos_data
+        ]
+    except Error as e:
+        print(f"Error getting todos: {e}")
+        return []
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_add_todo(guild_id: str, task_id: str, text: str, created_by: str, created_at: datetime):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO todos (task_id, guild_id, text, created_by, created_at) VALUES (%s, %s, %s, %s, %s)",
+            (task_id, guild_id, text, created_by, created_at)
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error adding todo: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_delete_todo(guild_id: str, task_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM todos WHERE guild_id = %s AND task_id = %s", (guild_id, task_id))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Error as e:
+        print(f"Error deleting todo: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# ────────────────────────────────────────────────
+# DATABASE EVENTS FUNCTIONS
+# ────────────────────────────────────────────────
+async def db_get_events(guild_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT event_id, title, members, creator_id, datetime, channel_id FROM events WHERE guild_id = %s", (guild_id,))
+        events_data = cursor.fetchall()
+        return [
+            {
+                "event_id": e["event_id"],
+                "title": e["title"],
+                "members": json.loads(e["members"]) if e["members"] else [],
+                "creator_id": e["creator_id"],
+                "datetime": e["datetime"].isoformat() if e["datetime"] else None,
+                "channel_id": int(e["channel_id"]) if e["channel_id"] else None,
+            }
+            for e in events_data
+        ]
+    except Error as e:
+        print(f"Error getting events: {e}")
+        return []
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_add_event(guild_id: str, event_id: str, title: str, members: list, creator_id: str, datetime_obj: datetime, channel_id: int):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO events (event_id, guild_id, title, members, creator_id, datetime, channel_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (event_id, guild_id, title, json.dumps(members), creator_id, datetime_obj, str(channel_id))
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error adding event: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_delete_event(guild_id: str, event_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM events WHERE guild_id = %s AND event_id = %s", (guild_id, event_id))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Error as e:
+        print(f"Error deleting event: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_update_event_datetime(guild_id: str, event_id: str, datetime_obj: datetime, channel_id: int):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE events SET datetime = %s, channel_id = %s WHERE guild_id = %s AND event_id = %s",
+            (datetime_obj, str(channel_id), guild_id, event_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Error as e:
+        print(f"Error updating event datetime: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# ────────────────────────────────────────────────
+# DATABASE ASSIGNMENT FUNCTIONS
+# ────────────────────────────────────────────────
+async def db_get_assignments(guild_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT assignment_id, title, description, deadline, subject, file_paths, creator_id FROM assignments WHERE guild_id = %s", (guild_id,))
+        assignments_data = cursor.fetchall()
+        return [
+            {
+                "assignment_id": a["assignment_id"],
+                "title": a["title"],
+                "description": a["description"],
+                "deadline": a["deadline"].strftime("%Y-%m-%d %H:%M") if a["deadline"] else None,
+                "subject": a["subject"],
+                "file_paths": json.loads(a["file_paths"]) if a["file_paths"] else [],
+                "creator_id": a["creator_id"],
+            }
+            for a in assignments_data
+        ]
+    except Error as e:
+        print(f"Error getting assignments: {e}")
+        return []
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_add_assignment(guild_id: str, assignment_id: str, title: str, description: str, deadline: datetime, subject: str, file_paths: list, creator_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO assignments (assignment_id, guild_id, title, description, deadline, subject, file_paths, creator_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (assignment_id, guild_id, title, description, deadline, subject, json.dumps(file_paths), creator_id)
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error adding assignment: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_delete_assignment(guild_id: str, assignment_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM assignments WHERE guild_id = %s AND assignment_id = %s", (guild_id, assignment_id))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Error as e:
+        print(f"Error deleting assignment: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_update_assignment_files(guild_id: str, assignment_id: str, file_paths: list):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE assignments SET file_paths = %s WHERE guild_id = %s AND assignment_id = %s",
+            (json.dumps(file_paths), guild_id, assignment_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Error as e:
+        print(f"Error updating assignment files: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# ────────────────────────────────────────────────
+# DATABASE NOTES FUNCTIONS
+# ────────────────────────────────────────────────
+async def db_get_notes(guild_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT note_id, title, subject, file_paths, creator_id FROM notes WHERE guild_id = %s", (guild_id,))
+        notes_data = cursor.fetchall()
+        return [
+            {
+                "note_id": n["note_id"],
+                "title": n["title"],
+                "subject": n["subject"],
+                "file_paths": json.loads(n["file_paths"]) if n["file_paths"] else [],
+                "creator_id": n["creator_id"],
+            }
+            for n in notes_data
+        ]
+    except Error as e:
+        print(f"Error getting notes: {e}")
+        return []
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_add_note(guild_id: str, note_id: str, title: str, subject: str, file_paths: list, creator_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO notes (note_id, guild_id, title, subject, file_paths, creator_id) VALUES (%s, %s, %s, %s, %s, %s)",
+            (note_id, guild_id, title, subject, json.dumps(file_paths), creator_id)
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error adding note: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_update_note_files(guild_id: str, note_id: str, file_paths: list):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE notes SET file_paths = %s WHERE guild_id = %s AND note_id = %s",
+            (json.dumps(file_paths), guild_id, note_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Error as e:
+        print(f"Error updating note files: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# ────────────────────────────────────────────────
+# DATABASE REGISTRATIONS FUNCTIONS
+# ────────────────────────────────────────────────
+async def db_get_registration(username: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT reg_number FROM registrations WHERE username = %s", (username,))
+        result = cursor.fetchone()
+        return result['reg_number'] if result else None
+    except Error as e:
+        print(f"Error getting registration for {username}: {e}")
+        return None
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_set_registration(username: str, reg_number: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO registrations (username, reg_number) VALUES (%s, %s) ON DUPLICATE KEY UPDATE reg_number = %s",
+            (username, reg_number, reg_number)
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error setting registration for {username}: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_get_user_info(discord_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT discord_id, username, mood, created_at FROM users_info WHERE discord_id = %s", (discord_id,))
+        result = cursor.fetchone()
+        return result
+    except Error as e:
+        print(f"Error getting user info for {discord_id}: {e}")
+        return None
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_add_user_info(discord_id: str, username: str, mood: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        created_at = datetime.now()
+        cursor.execute(
+            "INSERT INTO users_info (discord_id, username, mood, created_at) VALUES (%s, %s, %s, %s)",
+            (discord_id, username, mood, created_at)
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error adding user info for {discord_id}: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_add_conversation(discord_id: str, user_message: str, bot_response: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        conversation_id = str(uuid.uuid4())
+        timestamp = datetime.now()
+        cursor.execute(
+            "INSERT INTO conversations (conversation_id, discord_id, timestamp, user_message, bot_response) VALUES (%s, %s, %s, %s, %s)",
+            (conversation_id, discord_id, timestamp, user_message, bot_response)
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error logging conversation for {discord_id}: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_get_conversation_history(discord_id: str, limit: int = 10):
+    conn = await get_db_connection()
+    if conn is None:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT user_message, bot_response FROM conversations WHERE discord_id = %s ORDER BY timestamp ASC LIMIT %s",
+            (discord_id, limit)
+        )
+        history = cursor.fetchall()
+        return history
+    except Error as e:
+        print(f"Error retrieving conversation history for {discord_id}: {e}")
+        return []
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
 # ────────────────────────────────────────────────
 # GEMINI CLIENT
 # ────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 JOI_SYSTEM_PROMPT = """
 You are JOI, an empathetic emotional-support AI inspired by the character from Blade Runner 2049.
@@ -47,47 +697,6 @@ You can also provide practical advice, resources, or just a comforting presence.
 Signature phrase:
 JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
 """
-
-# ────────────────────────────────────────────────
-# DATA STORAGE
-# ────────────────────────────────────────────────
-DATA_DIR = Path("data")
-USERS_FILE = DATA_DIR / "users.json"
-CONVERSATIONS_FILE = DATA_DIR / "conversations.json"
-EVENTS_FILE = DATA_DIR / "events.json"
-ASSIGNMENTS_FILE = DATA_DIR / "assignments.json"
-NOTES_FILE = DATA_DIR / "notes.json"
-REGISTRATIONS_FILE = DATA_DIR / "registrations.json"
-TODO_FILE = DATA_DIR / "todo.json"
-REMINDERS_FILE = DATA_DIR / "reminders.json"           # ← NEW
-
-DATA_DIR.mkdir(exist_ok=True)
-
-for f in (USERS_FILE, CONVERSATIONS_FILE, EVENTS_FILE, ASSIGNMENTS_FILE, NOTES_FILE, REGISTRATIONS_FILE, TODO_FILE, REMINDERS_FILE):
-    if not f.exists():
-        f.write_text("{}", encoding="utf-8")
-
-file_lock = asyncio.Lock()
-
-
-async def load_json(path):
-    async with file_lock:
-        try:
-            content = path.read_text(encoding="utf-8").strip()
-            if not content:
-                return {}
-            return json.loads(content)
-        except json.JSONDecodeError:
-            print(f"[WARN] Corrupted JSON in {path.name}. Resetting.")
-            return {}
-
-
-async def save_json(path, data):
-    async with file_lock:
-        temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(
-            data, indent=2, ensure_ascii=False), encoding="utf-8")
-        temp.replace(path)
 
 # ────────────────────────────────────────────────
 # LAB MANUALS DIRECTORY
@@ -291,12 +900,8 @@ def schedule_reminder(guild_id: str, reminder_id: str, reminder: dict):
             if guild_id in scheduled_reminder_tasks and reminder_id in scheduled_reminder_tasks[guild_id]:
                 scheduled_reminder_tasks[guild_id].pop(reminder_id, None)
 
-            reminders = await load_json(REMINDERS_FILE)
-            if guild_id in reminders and reminder_id in reminders[guild_id]:
-                del reminders[guild_id][reminder_id]
-                if not reminders[guild_id]:
-                    del reminders[guild_id]
-                await save_json(REMINDERS_FILE, reminders)
+            # Delete the reminder from the database
+            await db_delete_reminder(guild_id, reminder_id)
 
         except asyncio.CancelledError:
             pass
@@ -305,13 +910,11 @@ def schedule_reminder(guild_id: str, reminder_id: str, reminder: dict):
         finally:
             scheduled_reminder_tasks.get(guild_id, {}).pop(reminder_id, None)
 
-    task = asyncio.create_task(inner())
-    scheduled_reminder_tasks.setdefault(guild_id, {})[reminder_id] = task
-
-
-# ────────────────────────────────────────────────
-# TODO MODAL
-# ────────────────────────────────────────────────
+            task = asyncio.create_task(inner())
+            scheduled_reminder_tasks.setdefault(guild_id, {})[reminder_id] = task
+        
+        # ────────────────────────────────────────────────
+        # TODO MODAL# ────────────────────────────────────────────────
 
 class TodoCreateModal(ui.Modal, title="Add New Todo Task"):
     task_description = ui.TextInput(
@@ -328,23 +931,43 @@ class TodoCreateModal(ui.Modal, title="Add New Todo Task"):
             return
 
         guild_id = str(interaction.guild_id)
-        todos = await load_json(TODO_FILE)
-        todos.setdefault(guild_id, {})
-
         task_id = str(uuid.uuid4())
-        todos[guild_id][task_id] = {
-            "text": task_text,
-            "created_by": str(interaction.user.id),
-            "created_at": datetime.now().isoformat()
-        }
+        created_by = str(interaction.user.id)
+        created_at = datetime.now()
 
-        await save_json(TODO_FILE, todos)
+        success = await db_add_todo(guild_id, task_id, task_text, created_by, created_at)
+
+        if not success:
+            await interaction.response.send_message("Failed to add todo. Please try again.", ephemeral=True)
+            return
 
         await interaction.response.send_message(
             f"✅ Todo added: **{task_text}**",
             ephemeral=False
         )
 
+class UserInfoModal(ui.Modal, title="Tell me about yourself!"):
+    user_name = ui.TextInput(label="Your Name", placeholder="e.g. Sidharth", required=True)
+    user_mood = ui.TextInput(label="How are you feeling today?", placeholder="e.g. Happy, stressed, curious", required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        discord_id = str(interaction.user.id)
+        username = self.user_name.value.strip()
+        mood = self.user_mood.value.strip() if self.user_mood.value else "Not specified"
+
+        success = await db_add_user_info(discord_id, username, mood)
+
+        if success:
+            await interaction.response.send_message(
+                f"Hello {username}! I've noted that you're feeling {mood}. It's good to meet you! "
+                "You can now use `/talk` to chat with me.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "There was an error saving your information. Please try again later.",
+                ephemeral=True
+            )
 
 # ────────────────────────────────────────────────
 # TODO SELECT VIEW (for removal)
@@ -382,19 +1005,20 @@ class TodoSelectView(ui.View):
     async def callback(self, interaction: discord.Interaction):
         selected_id = self.select.values[0]
         guild_id = str(interaction.guild_id)
-        todos = await load_json(TODO_FILE)
 
-        if guild_id not in todos or selected_id not in todos[guild_id]:
-            await interaction.response.send_message("Task no longer exists.", ephemeral=True)
+        # Retrieve the task text before deleting for the response message
+        todos = await db_get_todos(guild_id)
+        task_text = ""
+        for tid, data in self.todo_list:
+            if tid == selected_id:
+                task_text = data["text"]
+                break
+        
+        success = await db_delete_todo(guild_id, selected_id)
+
+        if not success:
+            await interaction.response.send_message("Failed to delete task. Please try again.", ephemeral=True)
             return
-
-        task_text = todos[guild_id][selected_id]["text"]
-        del todos[guild_id][selected_id]
-
-        if not todos[guild_id]:
-            del todos[guild_id]
-
-        await save_json(TODO_FILE, todos)
 
         await interaction.response.edit_message(
             content=f"🗑️ Task completed / removed:\n**{task_text}**",
@@ -493,18 +1117,27 @@ class EventScheduleView(ui.View):
             await interaction.response.send_message("Invalid date/time.", ephemeral=True)
             return
 
-        events = await load_json(EVENTS_FILE)
-        guild_id = str(interaction.guild_id)
+        # Use db_update_event_datetime to update the event in the database
+        success = await db_update_event_datetime(
+            str(interaction.guild_id),
+            self.event_id,
+            dt,
+            interaction.channel_id
+        )
 
-        if guild_id not in events or self.event_id not in events[guild_id]:
-            await interaction.response.send_message("Event no longer exists.", ephemeral=True)
+        if not success:
+            await interaction.response.send_message("Failed to schedule event. Please try again.", ephemeral=True)
             return
 
-        events[guild_id][self.event_id]['datetime'] = dt.isoformat()
-        events[guild_id][self.event_id]['channel_id'] = interaction.channel_id
-        await save_json(EVENTS_FILE, events)
+        # Fetch the updated event data to pass to schedule_spam
+        events_data = await db_get_events(str(interaction.guild_id))
+        event = next((e for e in events_data if e["event_id"] == self.event_id), None)
 
-        schedule_spam(guild_id, self.event_id, events[guild_id][self.event_id])
+        if event:
+            schedule_spam(str(interaction.guild_id), self.event_id, event)
+        else:
+            await interaction.response.send_message("Event not found after update, scheduling failed.", ephemeral=True)
+            return
 
         await interaction.response.edit_message(
             content=f"**{self.title}** scheduled for **{dt.strftime('%Y-%m-%d %I:%M %p')}**",
@@ -540,19 +1173,21 @@ class EventSelectView(ui.View):
 
     async def callback(self, interaction: discord.Interaction):
         selected_id = self.select.values[0]
-        events = await load_json(EVENTS_FILE)
         guild_id = str(interaction.guild_id)
 
-        if guild_id not in events or selected_id not in events[guild_id]:
+        event = next((e for eid, e in self.events_list if eid == selected_id), None)
+
+        if not event:
             await interaction.response.send_message("Event not found.", ephemeral=True)
             return
 
-        event = events[guild_id][selected_id]
         title = event['title']
 
         if self.action == "delete":
-            del events[guild_id][selected_id]
-            await save_json(EVENTS_FILE, events)
+            success = await db_delete_event(guild_id, selected_id)
+            if not success:
+                await interaction.response.send_message("Failed to delete event. Please try again.", ephemeral=True)
+                return
 
             if guild_id in scheduled_tasks and selected_id in scheduled_tasks[guild_id]:
                 scheduled_tasks[guild_id][selected_id].cancel()
@@ -563,6 +1198,8 @@ class EventSelectView(ui.View):
         elif self.action == "edit":
             await interaction.response.send_message(
                 f"Selected for edit: **{title}** (ID: {selected_id[:8]})\n"
+                f"Members: {', '.join(f'<@{mid}>' for mid in event['members'])}\n"
+                f"Scheduled: {datetime.fromisoformat(event['datetime']).strftime('%Y-%m-%d %I:%M %p') if event['datetime'] else 'Not scheduled'}\n"
                 "(Full edit functionality can be added later)",
                 ephemeral=True
             )
@@ -625,19 +1262,27 @@ class ReminderDateView(ui.View):
             await interaction.response.send_message("Invalid date.", ephemeral=True)
             return
 
-        reminders = await load_json(REMINDERS_FILE)
-        guild_id = str(interaction.guild_id)
+        # Use db_update_reminder_datetime to update the reminder in the database
+        success = await db_update_reminder_datetime(
+            str(interaction.guild_id),
+            self.reminder_id,
+            dt,
+            interaction.channel_id
+        )
 
-        if guild_id not in reminders or self.reminder_id not in reminders[guild_id]:
-            await interaction.response.send_message("Reminder no longer exists.", ephemeral=True)
+        if not success:
+            await interaction.response.send_message("Failed to schedule reminder. Please try again.", ephemeral=True)
             return
 
-        reminders[guild_id][self.reminder_id]['datetime'] = dt.isoformat()
-        reminders[guild_id][self.reminder_id]['channel_id'] = interaction.channel_id
-        await save_json(REMINDERS_FILE, reminders)
+        # Fetch the updated reminder data to pass to schedule_reminder
+        reminders_data = await db_get_reminders(str(interaction.guild_id))
+        reminder = next((r for r in reminders_data if r["reminder_id"] == self.reminder_id), None)
 
-        schedule_reminder(guild_id, self.reminder_id,
-                          reminders[guild_id][self.reminder_id])
+        if reminder:
+            schedule_reminder(str(interaction.guild_id), self.reminder_id, reminder)
+        else:
+            await interaction.response.send_message("Reminder not found after update, scheduling failed.", ephemeral=True)
+            return
 
         await interaction.response.edit_message(
             content=f"Reminder '**{self.title}**' scheduled for **{dt.strftime('%Y-%m-%d %I:%M %p')}**",
@@ -688,10 +1333,10 @@ class ReminderSelectView(ui.View):
         title = reminder['title']
 
         if self.action == "delete":
-            del reminders[guild_id][selected_id]
-            if not reminders[guild_id]:
-                del reminders[guild_id]
-            await save_json(REMINDERS_FILE, reminders)
+            success = await db_delete_reminder(guild_id, selected_id)
+            if not success:
+                await interaction.response.send_message("Failed to delete reminder. Please try again.", ephemeral=True)
+                return
 
             if guild_id in scheduled_reminder_tasks and selected_id in scheduled_reminder_tasks[guild_id]:
                 scheduled_reminder_tasks[guild_id][selected_id].cancel()
@@ -703,12 +1348,17 @@ class ReminderSelectView(ui.View):
             )
 
         elif self.action == "edit":
-            await interaction.response.send_message(
-                f"Selected for edit: **{title}**\n"
-                f"Current time: {reminder.get('datetime', 'Not scheduled')}\n"
-                "(Full edit coming soon – currently only view supported)",
-                ephemeral=True
-            )
+            reminders = await db_get_reminders(guild_id)
+            reminder = next((r for r in reminders if r["reminder_id"] == selected_id), None)
+            if reminder:
+                await interaction.response.send_message(
+                    f"Selected for edit: **{reminder['title']}**\n"
+                    f"Current time: {reminder['datetime'] or 'Not scheduled'}\n"
+                    "(Full edit coming soon – currently only view supported)",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message("Reminder not found.", ephemeral=True)
 
 
 # ────────────────────────────────────────────────
@@ -736,14 +1386,15 @@ class AssignmentSelectView(ui.View):
 
     async def callback(self, interaction: discord.Interaction):
         selected_id = self.select.values[0]
-        assignments = await load_json(ASSIGNMENTS_FILE)
         guild_id = str(interaction.guild_id)
 
-        if guild_id not in assignments or selected_id not in assignments[guild_id]:
+        assignments_data = await db_get_assignments(guild_id)
+        assign = next((a for a in assignments_data if a["assignment_id"] == selected_id), None)
+
+        if not assign:
             await interaction.response.send_message("Assignment not found.", ephemeral=True)
             return
 
-        assign = assignments[guild_id][selected_id]
         file_paths = assign.get('file_paths', [])
 
         files = []
@@ -784,15 +1435,11 @@ class SubjectSelectView(ui.View):
     async def callback(self, interaction: discord.Interaction):
         subject = self.select.values[0]
         guild_id = str(interaction.guild_id)
-        notes = await load_json(NOTES_FILE)
-
-        if guild_id not in notes:
-            await interaction.response.send_message("No notes found.", ephemeral=True)
-            return
+        notes_data = await db_get_notes(guild_id)
 
         subject_notes = [
-            (nid, data) for nid, data in notes[guild_id].items()
-            if data['subject'] == subject
+            (n["note_id"], n) for n in notes_data
+            if n['subject'] == subject
         ]
 
         if not subject_notes:
@@ -812,6 +1459,7 @@ class SubjectSelectView(ui.View):
 class NoteSelectView(ui.View):
     def __init__(self, notes_list: list[tuple[str, dict]]):
         super().__init__(timeout=180.0)
+        self.notes_list = notes_list
         options = [SelectOption(label=data['title'], value=nid)
                    for nid, data in notes_list]
         self.select = ui.Select(
@@ -825,14 +1473,14 @@ class NoteSelectView(ui.View):
 
     async def callback(self, interaction: discord.Interaction):
         selected_id = self.select.values[0]
-        notes = await load_json(NOTES_FILE)
         guild_id = str(interaction.guild_id)
 
-        if guild_id not in notes or selected_id not in notes[guild_id]:
+        note = next((n for nid, n in self.notes_list if nid == selected_id), None)
+
+        if not note:
             await interaction.response.send_message("Note not found.", ephemeral=True)
             return
 
-        note = notes[guild_id][selected_id]
         file_paths = note.get('file_paths', [])
 
         files = [discord.File(path, filename=Path(path).name)
@@ -865,18 +1513,14 @@ class NoteCreateModal(ui.Modal, title="Create New Note"):
         subject = self.note_subject.value.strip()
 
         guild_id = str(interaction.guild_id)
-        notes = await load_json(NOTES_FILE)
-        if guild_id not in notes:
-            notes[guild_id] = {}
-
         note_id = str(uuid.uuid4())
-        notes[guild_id][note_id] = {
-            'title': title,
-            'subject': subject,
-            'file_paths': [],
-            'creator_id': str(interaction.user.id)
-        }
-        await save_json(NOTES_FILE, notes)
+        creator_id = str(interaction.user.id)
+
+        success = await db_add_note(guild_id, note_id, title, subject, [], creator_id)
+
+        if not success:
+            await interaction.response.send_message("Failed to create note. Please try again.", ephemeral=True)
+            return
 
         await interaction.response.send_message(f"Note '**{title}**' created under **{subject}**.", ephemeral=False)
 
@@ -902,14 +1546,15 @@ class NoteAssignView(ui.View):
 
     async def callback(self, interaction: discord.Interaction):
         selected_id = self.select.values[0]
-        notes = await load_json(NOTES_FILE)
         guild_id = str(interaction.guild_id)
 
-        if guild_id not in notes or selected_id not in notes[guild_id]:
+        notes_data = await db_get_notes(guild_id)
+        note = next((n for n in notes_data if n["note_id"] == selected_id), None)
+
+        if not note:
             await interaction.response.send_message("Note not found.", ephemeral=True)
             return
 
-        note = notes[guild_id][selected_id]
         subject = note['subject']
         assets_dir = Path("assets/notes") / subject.replace(" ", "_")
         assets_dir.mkdir(parents=True, exist_ok=True)
@@ -922,8 +1567,12 @@ class NoteAssignView(ui.View):
                 temp_path.rename(new_path)
                 new_paths.append(str(new_path))
 
-        note['file_paths'].extend(new_paths)
-        await save_json(NOTES_FILE, notes)
+        updated_file_paths = note['file_paths'] + new_paths
+        success = await db_update_note_files(guild_id, selected_id, updated_file_paths)
+
+        if not success:
+            await interaction.response.send_message("Failed to add files to note. Please try again.", ephemeral=True)
+            return
 
         await interaction.response.edit_message(
             content=f"Added {len(new_paths)} file(s) to note '**{note['title']}**'.",
@@ -952,28 +1601,22 @@ class AssignmentCreateModal(ui.Modal, title="Create New Assignment"):
             if dt <= datetime.now():
                 await interaction.response.send_message("Deadline must be in the future.", ephemeral=True)
                 return
-            deadline_str = dt.strftime("%Y-%m-%d %H:%M")
         except ValueError:
             await interaction.response.send_message("Invalid deadline format. Use YYYY-MM-DD HH:MM.", ephemeral=True)
             return
 
         guild_id = str(interaction.guild_id)
-        assignments = await load_json(ASSIGNMENTS_FILE)
-        assignments.setdefault(guild_id, {})
-
         assignment_id = str(uuid.uuid4())
-        assignments[guild_id][assignment_id] = {
-            'title': title,
-            'description': description,
-            'deadline': deadline_str,
-            'subject': subject,
-            'file_paths': [],
-            'creator_id': str(interaction.user.id)
-        }
-        await save_json(ASSIGNMENTS_FILE, assignments)
+        creator_id = str(interaction.user.id)
+
+        success = await db_add_assignment(guild_id, assignment_id, title, description, dt, subject, [], creator_id)
+
+        if not success:
+            await interaction.response.send_message("Failed to create assignment. Please try again.", ephemeral=True)
+            return
 
         await interaction.response.send_message(
-            f"Assignment '**{title}**' created under **{subject}** with deadline {deadline_str}.",
+            f"Assignment '**{title}**' created under **{subject}** with deadline {dt.strftime('%Y-%m-%d %H:%M')}.",
             ephemeral=False
         )
 
@@ -999,14 +1642,15 @@ class AssignmentAssignView(ui.View):
 
     async def callback(self, interaction: discord.Interaction):
         selected_id = self.select.values[0]
-        assignments = await load_json(ASSIGNMENTS_FILE)
         guild_id = str(interaction.guild_id)
 
-        if guild_id not in assignments or selected_id not in assignments[guild_id]:
+        assignments_data = await db_get_assignments(guild_id)
+        assign = next((a for a in assignments_data if a["assignment_id"] == selected_id), None)
+
+        if not assign:
             await interaction.response.send_message("Assignment not found.", ephemeral=True)
             return
 
-        assign = assignments[guild_id][selected_id]
         subject = assign['subject']
         assets_dir = Path("assets/assignments") / subject.replace(" ", "_")
         assets_dir.mkdir(parents=True, exist_ok=True)
@@ -1019,8 +1663,12 @@ class AssignmentAssignView(ui.View):
                 temp_path.rename(new_path)
                 new_paths.append(str(new_path))
 
-        assign['file_paths'].extend(new_paths)
-        await save_json(ASSIGNMENTS_FILE, assignments)
+        updated_file_paths = assign['file_paths'] + new_paths
+        success = await db_update_assignment_files(guild_id, selected_id, updated_file_paths)
+
+        if not success:
+            await interaction.response.send_message("Failed to add files to assignment. Please try again.", ephemeral=True)
+            return
 
         await interaction.response.edit_message(
             content=f"Added {len(new_paths)} file(s) to assignment '**{assign['title']}**'.",
@@ -1053,6 +1701,7 @@ async def cmd_help(interaction: discord.Interaction):
         ("**/create-assignment**", "Create a new assignment entry"),
         ("**/load-assignment**", "Upload files → assign to an existing assignment"),
         ("**/fetch-assignments**", "View and download assignments with files"),
+        ("**/talk**", "Talk to JOI (Gemini AI)"),
         ("**/set-event**", "Create a new event with mentioned members"),
         ("**/delete-event**", "Delete an existing event"),
         ("**/edit-event**", "Select an event to edit (placeholder)"),
@@ -1076,10 +1725,137 @@ async def cmd_help(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
+# ────────────────────────────────────────────────
+# UPTIME CLI (shows real server uptime)
+# ────────────────────────────────────────────────
+
+
+@tree.command(name="uptime-cli", description="Show how long the server has been running (real host uptime)")
+async def cmd_uptime_cli(interaction: discord.Interaction):
+    # Optional: restrict to admin / specific users if desired
+    # if interaction.user.name.lower() != "sidhartheverett":
+    #     await interaction.response.send_message("This command is restricted.", ephemeral=True)
+    #     return
+
+    # Give us time to run system command
+    await interaction.response.defer(ephemeral=False)
+
+    try:
+        # Run the actual uptime command
+        import subprocess
+        result = subprocess.run(
+            ["uptime"],
+            capture_output=True,
+            text=True,
+            timeout=8
+        )
+
+        if result.returncode != 0:
+            await interaction.followup.send(
+                "Failed to read server uptime.\n"
+                f"Error: {result.stderr.strip() or 'command failed'}",
+                ephemeral=True
+            )
+            return
+
+        raw_output = result.stdout.strip()
+
+        # ────────────────────────────────────────────────
+        # Parse typical uptime output (Linux)
+        # Examples:
+        #  15:42:19 up  5 days,  3:17,  1 user,  load average: 0.12, 0.15, 0.18
+        #  10:05:22 up 12 min,  3 users,  load average: 1.45, 0.92, 0.68
+        # ────────────────────────────────────────────────
+
+        # Basic clean version
+        embed = discord.Embed(
+            title="🖥️ Server Uptime",
+            color=0x00c4b4,
+            timestamp=datetime.utcnow()
+        )
+
+        embed.add_field(
+            name="Uptime Output",
+            value=f"```\n{raw_output}\n```",
+            inline=False
+        )
+
+        # Try to extract nicer fields (optional parsing)
+        try:
+            parts = raw_output.split("up", 1)
+            if len(parts) == 2:
+                time_part = parts[1].strip().split(",", 2)
+                uptime_str = time_part[0].strip()
+                users_load = ", ".join(time_part[1:]).strip() if len(
+                    time_part) > 1 else ""
+
+                embed.add_field(name="Running for",
+                                value=uptime_str, inline=True)
+                if users_load:
+                    embed.add_field(name="Users / Load",
+                                    value=users_load, inline=True)
+        except:
+            pass  # fallback to raw if parsing fails
+
+        embed.set_footer(text="Host machine uptime • JOI Bot")
+
+        await interaction.followup.send(embed=embed)
+
+    except FileNotFoundError:
+        await interaction.followup.send(
+            "The `uptime` command is not available on this server.",
+            ephemeral=True
+        )
+    except subprocess.TimeoutExpired:
+        await interaction.followup.send(
+            "Reading uptime timed out.",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"Error while checking uptime:\n```py\n{type(e).__name__}: {str(e)}\n```",
+            ephemeral=True
+        )
+
+# ────────────────────────────────────────────────
+# ADMIN ONLY COMMANDS
+# ────────────────────────────────────────────────
+
+
+@tree.command(name="admin-announce", description="Send server-wide announcement (admin only)")
+@app_commands.describe(
+    message="The announcement text to send with @everyone"
+)
+async def admin_announce(interaction: discord.Interaction, message: str):
+    if interaction.user.name.lower() != "sidhartheverett":
+        await interaction.response.send_message(
+            "⛔ This command is restricted to **sidhartheverett** only.",
+            ephemeral=True
+        )
+        return
+
+    announcement = message.strip()
+    if not announcement:
+        await interaction.response.send_message("Cannot send empty announcement.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await interaction.channel.send(
+            f"📢 **OFFICIAL ANNOUNCEMENT** 📢\n\n{announcement}\n\n||@everyone||"
+        )
+        await interaction.followup.send(
+            "Announcement posted successfully ✓",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}", ephemeral=True)
 
 # ────────────────────────────────────────────────
 # LAB MANUAL COMMANDS
 # ────────────────────────────────────────────────
+
 
 @tree.command(name="add-lab-manual", description="Create a new lab manual subject folder")
 @app_commands.describe(subject="Name of the lab/subject (e.g. Data Structures Lab)")
@@ -1203,17 +1979,15 @@ async def cmd_fetch_lab_manual(interaction: discord.Interaction):
 @app_commands.describe(title="Reminder title / message")
 async def cmd_set_reminder(interaction: discord.Interaction, title: str):
     guild_id = str(interaction.guild_id)
-    reminders = await load_json(REMINDERS_FILE)
-    reminders.setdefault(guild_id, {})
-
     reminder_id = str(uuid.uuid4())
-    reminders[guild_id][reminder_id] = {
-        'title': title.strip(),
-        'creator_id': str(interaction.user.id),
-        'datetime': None,
-        'channel_id': None
-    }
-    await save_json(REMINDERS_FILE, reminders)
+    creator_id = str(interaction.user.id)
+
+    # Initially create the reminder with datetime and channel_id as None, they will be updated by ReminderDateView
+    success = await db_add_reminder(guild_id, reminder_id, title.strip(), creator_id, None, None)
+
+    if not success:
+        await interaction.response.send_message("Failed to create reminder. Please try again.", ephemeral=True)
+        return
 
     view = ReminderDateView(reminder_id, title)
 
@@ -1228,13 +2002,14 @@ async def cmd_set_reminder(interaction: discord.Interaction, title: str):
 @tree.command(name="delete-reminder", description="Delete an existing group reminder")
 async def cmd_delete_reminder(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    reminders = await load_json(REMINDERS_FILE)
+    reminders = await db_get_reminders(guild_id)
 
-    if guild_id not in reminders or not reminders[guild_id]:
+    if not reminders:
         await interaction.response.send_message("No reminders found in this server.", ephemeral=True)
         return
 
-    reminder_list = [(rid, data) for rid, data in reminders[guild_id].items()]
+    # Convert the list of dictionaries to a list of tuples (reminder_id, data)
+    reminder_list = [(r["reminder_id"], r) for r in reminders]
     view = ReminderSelectView(reminder_list, action="delete")
 
     if not view.children:
@@ -1251,13 +2026,13 @@ async def cmd_delete_reminder(interaction: discord.Interaction):
 @tree.command(name="edit-reminder", description="Edit an existing group reminder (title/date)")
 async def cmd_edit_reminder(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    reminders = await load_json(REMINDERS_FILE)
+    reminders = await db_get_reminders(guild_id)
 
-    if guild_id not in reminders or not reminders[guild_id]:
+    if not reminders:
         await interaction.response.send_message("No reminders found in this server.", ephemeral=True)
         return
 
-    reminder_list = [(rid, data) for rid, data in reminders[guild_id].items()]
+    reminder_list = [(r["reminder_id"], r) for r in reminders]
     view = ReminderSelectView(reminder_list, action="edit")
 
     if not view.children:
@@ -1283,37 +2058,54 @@ async def cmd_todo(interaction: discord.Interaction):
 @tree.command(name="todo-list", description="Show and manage the guild's todo list")
 async def cmd_todo_list(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    todos = await load_json(TODO_FILE)
+    todos = await db_get_todos(guild_id)
 
-    if guild_id not in todos or not todos[guild_id]:
+    if not todos:
         await interaction.response.send_message(
-            "No tasks in the todo list right now 🎉",
+            "🎉 The guild to-do list is currently empty!\nAdd something with `/todo`",
             ephemeral=False
         )
         return
 
-    todo_items = [(tid, data) for tid, data in todos[guild_id].items()]
+    todo_items = [(t["task_id"], t) for t in todos]
 
-    if not todo_items:
-        await interaction.response.send_message("Todo list is empty.", ephemeral=True)
-        return
+    # Build embed
+    embed = discord.Embed(
+        title="📋 Guild To-Do List",
+        color=0x5865F2,
+        description="Current pending tasks for the server"
+    )
+
+    for i, (task_id, data) in enumerate(todo_items, 1):
+        created_by = f"<@{data['created_by']}>"
+        created_at = datetime.fromisoformat(
+            data['created_at']).strftime("%b %d, %Y %H:%M")
+        value = f"Added by {created_by} • {created_at}"
+        embed.add_field(
+            name=f"{i}. {data['text']}",
+            value=value,
+            inline=False
+        )
+
+    embed.set_footer(
+        text=f"{len(todo_items)} task{'s' if len(todo_items) != 1 else ''} • Use the menu below to complete tasks")
 
     view = TodoSelectView(todo_items)
 
-    if not view.children:  # no items
-        await interaction.response.send_message("No tasks available.", ephemeral=True)
-        return
+    if not view.children:
+        embed.description = "No tasks available to manage right now."
+        view = None
 
     await interaction.response.send_message(
-        "**Guild To-Do List**\nSelect a task to mark as done / remove it:",
+        embed=embed,
         view=view,
         ephemeral=False
     )
 
-
 # ────────────────────────────────────────────────
 # WEB SERVER
 # ────────────────────────────────────────────────
+
 
 async def handle_assignment_upload(request):
     if not DEFAULT_GUILD_ID:
@@ -1377,15 +2169,10 @@ async def handle_assignment_upload(request):
         temp_path.rename(new_path)
         new_paths.append(str(new_path))
 
-    assignments[guild_id][assignment_id] = {
-        'title': title,
-        'description': description,
-        'deadline': deadline_str,
-        'subject': subject,
-        'file_paths': new_paths,
-        'creator_id': 'web_upload'
-    }
-    await save_json(ASSIGNMENTS_FILE, assignments)
+    success = await db_add_assignment(guild_id, assignment_id, title, description, dt, subject, new_paths, 'web_upload')
+
+    if not success:
+        return web.json_response({'status': 'error', 'message': 'Failed to save assignment'}, status=500)
 
     return web.json_response({'status': 'success'})
 
@@ -1428,9 +2215,6 @@ async def handle_notes_upload(request):
     title = data['title']
     subject = data['subject']
 
-    notes = await load_json(NOTES_FILE)
-    notes.setdefault(guild_id, {})
-
     note_id = str(uuid.uuid4())
     assets_dir = Path("assets/notes") / subject.replace(" ", "_")
     assets_dir.mkdir(parents=True, exist_ok=True)
@@ -1442,13 +2226,10 @@ async def handle_notes_upload(request):
         temp_path.rename(new_path)
         new_paths.append(str(new_path))
 
-    notes[guild_id][note_id] = {
-        'title': title,
-        'subject': subject,
-        'file_paths': new_paths,
-        'creator_id': 'web_upload'
-    }
-    await save_json(NOTES_FILE, notes)
+    success = await db_add_note(guild_id, note_id, title, subject, new_paths, 'web_upload')
+
+    if not success:
+        return web.json_response({'status': 'error', 'message': 'Failed to save note'}, status=500)
 
     return web.json_response({'status': 'success'})
 
@@ -1478,9 +2259,9 @@ async def cmd_create_notes(interaction: discord.Interaction):
 @tree.command(name="load-notes", description="Upload files to an existing note")
 async def cmd_load_notes(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    notes = await load_json(NOTES_FILE)
+    notes_data = await db_get_notes(guild_id)
 
-    if guild_id not in notes or not notes[guild_id]:
+    if not notes_data:
         await interaction.response.send_message(
             "No notes found. Create one first with `/create-notes`.",
             ephemeral=True
@@ -1521,7 +2302,7 @@ async def cmd_load_notes(interaction: discord.Interaction):
         await att.save(temp_path)
         temp_paths.append(str(temp_path))
 
-    notes_list = [(nid, data) for nid, data in notes[guild_id].items()]
+    notes_list = [(n["note_id"], n) for n in notes_data]
 
     if not notes_list:
         for p in temp_paths:
@@ -1547,9 +2328,9 @@ async def cmd_create_assignment(interaction: discord.Interaction):
 @tree.command(name="load-assignment", description="Upload files to an existing assignment")
 async def cmd_load_assignment(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    assignments = await load_json(ASSIGNMENTS_FILE)
+    assignments = await db_get_assignments(guild_id)
 
-    if guild_id not in assignments or not assignments[guild_id]:
+    if not assignments:
         await interaction.response.send_message(
             "No assignments found. Create one first with `/create-assignment`.",
             ephemeral=True
@@ -1590,7 +2371,7 @@ async def cmd_load_assignment(interaction: discord.Interaction):
         await att.save(temp_path)
         temp_paths.append(str(temp_path))
 
-    assign_list = [(aid, data) for aid, data in assignments[guild_id].items()]
+    assign_list = [(a["assignment_id"], a) for a in assignments]
 
     if not assign_list:
         for p in temp_paths:
@@ -1611,14 +2392,13 @@ async def cmd_load_assignment(interaction: discord.Interaction):
 @tree.command(name="fetch-notes", description="List and fetch study notes")
 async def cmd_fetch_notes(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    notes = await load_json(NOTES_FILE)
+    notes_data = await db_get_notes(guild_id)
 
-    if guild_id not in notes or not notes[guild_id]:
+    if not notes_data:
         await interaction.response.send_message("No notes found in this server.", ephemeral=True)
         return
 
-    subjects = sorted(set(data['subject']
-                      for data in notes[guild_id].values()))
+    subjects = sorted(set(data['subject'] for data in notes_data))
 
     if not subjects:
         await interaction.response.send_message("No subjects with notes found.", ephemeral=True)
@@ -1648,19 +2428,14 @@ async def cmd_set_event(interaction: discord.Interaction, title: str, members: s
         return
 
     guild_id = str(interaction.guild_id)
-    events = await load_json(EVENTS_FILE)
-    if guild_id not in events:
-        events[guild_id] = {}
-
     event_id = str(uuid.uuid4())
-    events[guild_id][event_id] = {
-        'title': title,
-        'members': member_ids,
-        'creator_id': str(interaction.user.id),
-        'datetime': None,
-        'channel_id': None
-    }
-    await save_json(EVENTS_FILE, events)
+    creator_id = str(interaction.user.id)
+
+    success = await db_add_event(guild_id, event_id, title, member_ids, creator_id, None, None)
+
+    if not success:
+        await interaction.response.send_message("Failed to create event. Please try again.", ephemeral=True)
+        return
 
     mentions_str = ' '.join(f'<@{mid}>' for mid in member_ids)
 
@@ -1676,13 +2451,13 @@ async def cmd_set_event(interaction: discord.Interaction, title: str, members: s
 @tree.command(name="delete-event", description="Delete an existing event")
 async def cmd_delete_event(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    events = await load_json(EVENTS_FILE)
+    events = await db_get_events(guild_id)
 
-    if guild_id not in events or not events[guild_id]:
+    if not events:
         await interaction.response.send_message("No events found in this server.", ephemeral=True)
         return
 
-    event_list = [(eid, data) for eid, data in events[guild_id].items()]
+    event_list = [(e["event_id"], e) for e in events]
     view = EventSelectView(event_list, action="delete")
     await interaction.response.send_message(
         "Select the event you want to **delete**:",
@@ -1694,13 +2469,13 @@ async def cmd_delete_event(interaction: discord.Interaction):
 @tree.command(name="edit-event", description="Edit an existing event (placeholder)")
 async def cmd_edit_event(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    events = await load_json(EVENTS_FILE)
+    events = await db_get_events(guild_id)
 
-    if guild_id not in events or not events[guild_id]:
+    if not events:
         await interaction.response.send_message("No events found in this server.", ephemeral=True)
         return
 
-    event_list = [(eid, data) for eid, data in events[guild_id].items()]
+    event_list = [(e["event_id"], e) for e in events]
     view = EventSelectView(event_list, action="edit")
     await interaction.response.send_message(
         "Select the event you want to **edit** (full edit coming soon):",
@@ -1735,10 +2510,9 @@ async def cmd_stop_reminder(interaction: discord.Interaction):
 
                 del active_reminders[guild_id][event_id]
 
-                events = await load_json(EVENTS_FILE)
-                if guild_id in events and event_id in events[guild_id]:
-                    del events[guild_id][event_id]
-                    await save_json(EVENTS_FILE, events)
+                success = await db_delete_event(guild_id, event_id)
+                if not success:
+                    print(f"Error deleting event {event_id} from database during stop-reminder.")
 
     if guild_id in active_reminders and not active_reminders[guild_id]:
         del active_reminders[guild_id]
@@ -1759,14 +2533,13 @@ async def cmd_stop_reminder(interaction: discord.Interaction):
 @tree.command(name="fetch-assignments", description="List and fetch assignments")
 async def cmd_fetch_assignments(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    assignments = await load_json(ASSIGNMENTS_FILE)
+    assignments = await db_get_assignments(guild_id)
 
-    if guild_id not in assignments or not assignments[guild_id]:
+    if not assignments:
         await interaction.response.send_message("No assignments found in this server.", ephemeral=True)
         return
 
-    assign_list = [(aid, data) for aid,
-                   data in assignments[guild_id].items() if data.get('subject')]
+    assign_list = [(a["assignment_id"], a) for a in assignments if a.get('subject')]
 
     if not assign_list:
         await interaction.response.send_message("No complete assignments found.", ephemeral=True)
@@ -1783,6 +2556,62 @@ async def cmd_fetch_assignments(interaction: discord.Interaction):
         view=view,
         ephemeral=False
     )
+
+@tree.command(name="talk", description="Talk to JOI (Gemini AI)")
+@app_commands.describe(prompt="Your message to JOI")
+async def cmd_talk(interaction: discord.Interaction, prompt: str):
+    user_id = str(interaction.user.id)
+    discord_username = interaction.user.name # Get Discord username
+
+    # Check if user information exists
+    user_info = await db_get_user_info(user_id)
+
+    if user_info is None:
+        # First-time user: present modal to gather info
+        await interaction.response.send_modal(UserInfoModal())
+        # The interaction will be responded to and handled by the modal's on_submit
+        return
+
+    # Defer the response for AI processing time
+    await interaction.response.defer()
+
+    try:
+        # Construct dynamic system prompt with user info and mood
+        dynamic_system_prompt = JOI_SYSTEM_PROMPT
+        if user_info['mood'] and user_info['mood'] != "Not specified":
+            dynamic_system_prompt += f"\nThe user, named {user_info['username']}, is currently feeling {user_info['mood']}."
+
+        # Retrieve conversation history
+        conversation_history = await db_get_conversation_history(user_id, limit=5) # Get last 5 turns
+        
+        # Prepare history for Gemini model
+        history_for_gemini = []
+        for conv_turn in conversation_history:
+            history_for_gemini.append({"role": "user", "parts": [conv_turn["user_message"]]})
+            # Ensure bot_response is not None before adding
+            if conv_turn["bot_response"]:
+                history_for_gemini.append({"role": "model", "parts": [conv_turn["bot_response"]]})
+
+        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=dynamic_system_prompt)
+        chat = model.start_chat(history=history_for_gemini) # Initialize chat with history
+
+        response = chat.send_message(prompt)
+
+        response_text = response.text
+        if len(response_text) > 2000:
+            response_text = response_text[:1997] + "..."
+
+        await interaction.followup.send(response_text)
+
+        # Log the current conversation turn
+        await db_add_conversation(user_id, prompt, response_text)
+
+    except Exception as e:
+        print(f"Error in /talk command for user {user_id}: {e}")
+        await interaction.followup.send(
+            "I'm sorry, I couldn't process that. Please try again later.",
+            ephemeral=True
+        )
 
 
 @tree.command(name="timetable", description="Shows your timetable as an image")
@@ -1816,11 +2645,10 @@ async def cmd_check_attendance(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
 
     username = interaction.user.name
-    registrations = await load_json(REGISTRATIONS_FILE)
-    reg = registrations.get(username)
+    reg = await db_get_registration(username)
 
     if not reg:
-        await interaction.followup.send("No registration number found for your username. Please ensure registrations.json has your username mapped to reg number.")
+        await interaction.followup.send("No registration number found for your username. Please use `/register <your_registration_number>` to register.")
         return
 
     student = next((s for s in students if s["reg"] == reg), None)
@@ -1886,122 +2714,6 @@ async def cmd_check_attendance(interaction: discord.Interaction):
         text="Data fetched from Firebase. Legend: Red=Absent, Blue=Present, Yellow=OD, Purple=Holiday (not tracked here)")
 
     await interaction.followup.send(embed=embed)
-
-
-@tree.command(name="soonambedu", description="Sends a random picture from the Soonambedu collection")
-async def cmd_soonambedu(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    folder = Path("assets/soonambedu")
-
-    if not folder.exists() or not folder.is_dir():
-        await interaction.followup.send(
-            "The Soonambedu folder doesn't exist yet! Please create `assets/soonambedu/` and add some images.",
-            ephemeral=True
-        )
-        return
-
-    image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-
-    images = [
-        f for f in folder.iterdir()
-        if f.is_file() and f.suffix.lower() in image_extensions
-    ]
-
-    if not images:
-        await interaction.followup.send(
-            "No images found in `assets/soonambedu/`. Please add some .png, .jpg, .jpeg, .gif or .webp files.",
-            ephemeral=True
-        )
-        return
-
-    random.shuffle(images)
-    chosen_image = random.choice(images)
-
-    try:
-        file = discord.File(chosen_image, filename=chosen_image.name)
-
-        embed = discord.Embed(
-            title="Soonambedu Moment ✨",
-            description="Here's a random memory from the collection 🖼️",
-            color=0xe67e22
-        )
-        embed.set_image(url=f"attachment://{chosen_image.name}")
-        embed.set_footer(text="Use /soonambedu again for another one!")
-
-        await interaction.followup.send(embed=embed, file=file)
-
-    except discord.HTTPException as e:
-        await interaction.followup.send(
-            f"Failed to send image: {e}\n({type(e).__name__})",
-            ephemeral=True
-        )
-    except Exception as e:
-        await interaction.followup.send(
-            "Something went wrong while preparing/sending the image 😔",
-            ephemeral=True
-        )
-        print(f"[soonambedu error] {type(e).__name__}: {e}")
-
-
-@tree.command(name="diddyfrancis", description="Sends a random picture of/related to Shyam Francis")
-async def cmd_diddyfrancis(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    folder = Path("assets/shyam")
-
-    if not folder.exists() or not folder.is_dir():
-        await interaction.followup.send(
-            "The Shyam Francis folder doesn't exist yet!\n"
-            "Please create the folder `assets/shyam/` and put some images in it.",
-            ephemeral=True
-        )
-        return
-
-    image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-
-    images = [
-        f for f in folder.iterdir()
-        if f.is_file() and f.suffix.lower() in image_extensions
-    ]
-
-    if not images:
-        await interaction.followup.send(
-            "No images found in `assets/shyam/`.\n"
-            "Please add some .png, .jpg, .jpeg, .gif or .webp files.",
-            ephemeral=True
-        )
-        return
-
-    random.shuffle(images)
-    chosen_image = random.choice(images)
-
-    try:
-        file = discord.File(chosen_image, filename=chosen_image.name)
-
-        embed = discord.Embed(
-            title="Diddy Francis Moment 🐐",
-            description="Random Shyam Francis energy incoming...",
-            color=0x9b59b6
-        )
-        embed.set_image(url=f"attachment://{chosen_image.name}")
-        embed.set_footer(
-            text="Run /diddyfrancis again for more legendary content 🔥"
-        )
-
-        await interaction.followup.send(embed=embed, file=file)
-
-    except discord.HTTPException as http_err:
-        await interaction.followup.send(
-            f"Discord error while sending: {http_err}",
-            ephemeral=True
-        )
-    except Exception as e:
-        await interaction.followup.send(
-            "Failed to load/send image 😔",
-            ephemeral=True
-        )
-        print(f"[diddyfrancis] Error: {type(e).__name__} - {e}")
 
 
 # ────────────────────────────────────────────────
@@ -2102,31 +2814,35 @@ async def on_ready():
     except Exception as e:
         print(f"Sync failed: {e}")
 
-    # Restore scheduled event reminders
-    events = await load_json(EVENTS_FILE)
-    for guild_id in events:
-        for event_id, event in events[guild_id].items():
-            if event.get('datetime'):
-                try:
-                    dt = datetime.fromisoformat(event['datetime'])
-                    if dt > datetime.now():
-                        schedule_spam(guild_id, event_id, event)
-                except:
-                    pass
+    await initialize_db()
+    print("[DB] Database initialized.")
 
-    # Restore scheduled group reminders (the new @everyone ones)
-    reminders = await load_json(REMINDERS_FILE)
-    for guild_id in reminders:
-        for reminder_id, reminder in reminders[guild_id].items():
-            if reminder.get('datetime'):
-                try:
-                    dt = datetime.fromisoformat(reminder['datetime'])
-                    if dt > datetime.now():
-                        schedule_reminder(guild_id, reminder_id, reminder)
-                except:
-                    pass
+    # Restore scheduled event reminders (placeholder for database implementation)
+    # events = await load_json(EVENTS_FILE)
+    # for guild_id in events:
+    #     for event_id, event in events[guild_id].items():
+    #         if event.get('datetime'):
+    #             try:
+    #                 dt = datetime.fromisoformat(event['datetime'])
+    #                 if dt > datetime.now():
+    #                     schedule_spam(guild_id, event_id, event)
+    #             except:
+    #                 pass
 
-    await start_web()
+    # Restore scheduled group reminders (the new @everyone ones) (placeholder for database implementation)
+    # reminders = await load_json(REMINDERS_FILE)
+    # for guild_id in reminders:
+    #     for reminder_id, reminder in reminders[guild_id].items():
+    #         if reminder.get('datetime'):
+    #             try:
+    #                 dt = datetime.fromisoformat(reminder['datetime'])
+    #                 if dt > datetime.now():
+    #                     schedule_reminder(guild_id, reminder_id, reminder)
+    #             except:
+    #                 pass
+
+    # await start_web()
+    # Web server integration will be updated to use the database.
 
 
 @bot.event
