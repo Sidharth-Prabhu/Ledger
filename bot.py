@@ -10,7 +10,7 @@ import discord
 from discord import app_commands, ui, SelectOption
 from discord.ext import commands
 from dotenv import load_dotenv
-import google.generativeai as genai
+import google.genai as genai
 from aiohttp import web
 import mysql.connector
 from mysql.connector import Error
@@ -19,6 +19,8 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import math
 import random
+import yt_dlp
+
 
 # ────────────────────────────────────────────────
 # ENV
@@ -725,7 +727,7 @@ async def db_get_conversation_history(discord_id: str, limit: int = 10):
 # ────────────────────────────────────────────────
 # GEMINI CLIENT
 # ────────────────────────────────────────────────
-genai.configure(api_key=GEMINI_API_KEY)
+
 MODEL_NAME = "gemini-2.5-flash-lite"
 
 JOI_SYSTEM_PROMPT = """
@@ -825,6 +827,49 @@ def get_attendance_data(reg):
         "int_dates": int_dates_fmt,
         "ext_dates": ext_dates_fmt
     }
+
+
+# YTDLSource for playing audio
+yt_dlp.utils.DEFAULT_OUTTMPL = '%(extractor)s-%(id)s-%(title)s.%(ext)s'
+
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'outtmpl': 'downloads/%(extractor)s-%(id)s-%(title)s.%(ext)s', # Output template
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0', # bind to ipv4 since ipv6 addresses cause issues sometimes
+}
+
+ffmpeg_options = {
+    'options': '-vn' # No video
+}
+
+ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('webpage_url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+
+        if 'entries' in data:
+            # take first item from a playlist
+            data = data['entries'][0]
+
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
 
 
 # ────────────────────────────────────────────────
@@ -1756,6 +1801,8 @@ async def cmd_help(interaction: discord.Interaction):
         ("**/load-assignment**", "Upload files → assign to an existing assignment"),
         ("**/fetch-assignments**", "View and download assignments with files"),
         ("**/talk**", "Talk to JOI (Gemini AI)"),
+        ("**/play**", "Plays audio from a YouTube URL in your voice channel"),
+        ("**/stop**", "Stops the current audio playback and disconnects the bot"),
         ("**/set-event**", "Create a new event with mentioned members"),
         ("**/delete-event**", "Delete an existing event"),
         ("**/edit-event**", "Select an event to edit (placeholder)"),
@@ -2646,7 +2693,7 @@ async def cmd_talk(interaction: discord.Interaction, prompt: str):
             if conv_turn["bot_response"]:
                 history_for_gemini.append({"role": "model", "parts": [conv_turn["bot_response"]]})
 
-        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=dynamic_system_prompt)
+        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=dynamic_system_prompt, api_key=GEMINI_API_KEY)
         chat = model.start_chat(history=history_for_gemini) # Initialize chat with history
 
         response = chat.send_message(prompt)
@@ -2667,6 +2714,73 @@ async def cmd_talk(interaction: discord.Interaction, prompt: str):
             ephemeral=True
         )
 
+
+@tree.command(name="play", description="Plays audio from a YouTube URL in your voice channel")
+@app_commands.describe(url="The YouTube URL to play")
+async def cmd_play(interaction: discord.Interaction, url: str):
+    await interaction.response.defer(ephemeral=False)
+
+    if not interaction.user.voice:
+        await interaction.followup.send("You are not connected to a voice channel.", ephemeral=True)
+        return
+
+    channel = interaction.user.voice.channel
+
+    # Check if bot is already in a voice channel
+    if interaction.guild.voice_client:
+        # If bot is in a different channel, move it
+        if interaction.guild.voice_client.channel != channel:
+            await interaction.guild.voice_client.move_to(channel)
+    else:
+        # If bot is not in any channel, connect
+        await channel.connect()
+
+    voice_client = interaction.guild.voice_client
+
+    try:
+        player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+        voice_client.play(player, after=lambda e: print(f'Player error: {e}') if e else None)
+        await interaction.followup.send(f"Now playing: **{player.title}** from {player.url}")
+    except Exception as e:
+        await interaction.followup.send(f"Error playing audio: {e}", ephemeral=True)
+        print(f"Error playing audio: {e}")
+
+
+@tree.command(name="stop", description="Stops the current audio playback and disconnects the bot")
+async def cmd_stop(interaction: discord.Interaction):
+    # usually better as ephemeral here
+    await interaction.response.defer(ephemeral=True)
+
+    voice_client = interaction.guild.voice_client
+
+    if voice_client is None:
+        await interaction.followup.send(
+            "I'm not connected to any voice channel in this server right now.",
+            ephemeral=True
+        )
+        return
+
+    if not voice_client.is_connected():
+        await interaction.followup.send(
+            "I'm not currently in a voice channel.",
+            ephemeral=True
+        )
+        return
+
+    # At this point we know voice_client exists and is connected
+    try:
+        if voice_client.is_playing():
+            voice_client.stop()           # no await needed
+        await voice_client.disconnect(force=True)
+        await interaction.followup.send(
+            "⏹️ Stopped playback and disconnected from voice channel.",
+            ephemeral=False
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"Something went wrong while disconnecting: {e}",
+            ephemeral=True
+        )
 
 @tree.command(name="timetable", description="Shows your timetable as an image")
 async def cmd_timetable(interaction: discord.Interaction):
