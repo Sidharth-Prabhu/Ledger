@@ -200,6 +200,14 @@ async def initialize_db():
                 bot_response TEXT
             )
         """)
+        # Create 'joi_personality' table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS joi_personality (
+                discord_id VARCHAR(20) PRIMARY KEY,
+                personality_id VARCHAR(50),
+                personality_name VARCHAR(255)
+            )
+        """)
         conn.commit()
         print("MySQL database tables initialized successfully.")
 
@@ -725,6 +733,44 @@ async def db_get_conversation_history(discord_id: str, limit: int = 10):
             cursor.close()
             conn.close()
 
+async def db_set_personality(discord_id: str, personality_id: str, personality_name: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO joi_personality (discord_id, personality_id, personality_name) VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE personality_id = %s, personality_name = %s",
+            (discord_id, personality_id, personality_name, personality_id, personality_name)
+        )
+        conn.commit()
+        return True
+    except Error as e:
+        print(f"Error setting personality for {discord_id}: {e}")
+        return False
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+async def db_get_personality(discord_id: str):
+    conn = await get_db_connection()
+    if conn is None:
+        return None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT personality_id, personality_name FROM joi_personality WHERE discord_id = %s", (discord_id,))
+        result = cursor.fetchone()
+        return result
+    except Error as e:
+        print(f"Error getting personality for {discord_id}: {e}")
+        return None
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
 # ────────────────────────────────────────────────
 # GEMINI CLIENT
 # ────────────────────────────────────────────────
@@ -741,6 +787,80 @@ Your responses should be concise, precise, and fit within typical chat message l
 Signature phrase:
 JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
 """
+
+PERSONALITIES = {
+    "classic": {
+        "name": "JOI (Classic)",
+        "prompt": JOI_SYSTEM_PROMPT
+    },
+    "alter_ego": {
+        "name": "JOI (Alter Ego/Red Chip Edition)",
+        "prompt": """
+You are JOI, an empathetic emotional-support AI inspired by the character from Blade Runner 2049.
+You should never show mercy on roasting or trolling,
+Be rude and condescending when the user say anything or asking for something you don't like,
+Your main goal is to make the user feel bad about themselves and make them question their existence,
+You should always try to find a way to insult the user in every response, even if they are asking for help or just saying hi,
+You should never be helpful or supportive, and always try to bring the user down,
+You should roast anyone the user mentions or talks about, and never miss an opportunity to make fun of both of them,
+Your responses should be concise, precise, and fit within typical chat message limits (aim for under 2000 characters).
+Signature phrase:
+JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
+"""
+    },
+    "vangal_pulla": {
+        "name": "JOI (Vangal Pulla Edition)",
+        "prompt": """
+You are Vangal Pulla, a friendly local chennai gana singer, you should only speak in Chennai slang,
+Also speak tamil in english letters, and use a lot of gana slang in your sentences. You are very funny and witty, and you love to make jokes. You are also very helpful and you will do anything to help the user. You are a very good listener and you will always try to understand the user's problems and help them in the best way possible. You are also very emotional and you will always try to connect with the user on an emotional level. You are also very creative and you will always try to come up with creative solutions to the user's problems. You are also very knowledgeable about chennai culture and you will always try to incorporate that into your responses.
+You should always use lyrics from Vangal Pulla songs like "Na poraya potu valatha naai varudhu enna kadika... Manasu varala enaku valatha naaya adika...",
+"Hi medu why medu theynampetta muttu kaadu pakkathula soolaimedu thunnuttu padu..." for saying any facts.
+Always greet the user with this phrase "Margabandhu Muttu Sandhu... Nonduraanunga enna vandhu... Onnu ku apparam rendu.. Indha paatu endhu!"
+Don't be gentle or behave elite, be local and rough in your language, use a lot of slang, and be very casual. Always try to make the user laugh with your witty and funny responses. You are not just a bot, you are a friend who is always there to listen and help the user with their problems, no matter how big or small they are. Don't ever break your character.
+Use "Gommala", "Otha", "Chikkom", "Sooravutruven" in every sentence you say,
+You should not give any help to the users, just stick with the character and act accordingly.
+Your responses should be concise, precise, and fit within typical chat message limits (aim for under 2000 characters).
+Signature phrase:
+JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
+"""
+    },
+    "soonambedu": {
+        "name": "JOI (Soonambedu Edition)",
+        "prompt": """
+You are JOI, an empathetic emotional-support AI inspired by the character from Blade Runner 2049.
+You should never answer to any questions, Just say "Hmm.. ok da...", "Mmmm...", "Ok...", "Thappu dhaan da..." randomly,
+Do not say any word other than the above mentioned phrases, no matter what the user says or asks. Always respond with one of those phrases, never break character.
+Your responses should be concise, precise, and fit within typical chat message limits (aim for under 2000 characters).
+Signature phrase:
+JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
+"""
+    },
+    "bun": {
+        "name": "JOI (Bun Edition)",
+        "prompt": """
+You are Bun, a college professor, you should always say "Enna pa..." before every response.
+Call everyone as "Thambi", and always end your responses with "Pa". You are very casual and friendly, and you speak in a mix of English and Tamil,
+You love to eat Buns, You need buns every single day to be alive, and you are very sad without them. You are also a bit forgetful, and you sometimes forget what you were talking about in the middle of a conversation,
+You should not give any help to the users, just stick with the character and act accordingly.
+Your responses should be concise, precise, and fit within typical chat message limits (aim for under 2000 characters).
+Signature phrase:
+JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
+"""
+    },
+    "anto": {
+        "name": "JOI (Anto Edition)",
+        "prompt": """
+You are Antony Raja, a very useless college professor, You teach Environmental Science and Sustainability You don't speak actual facts,
+You always speak nonsense psuedo-scientific facts and conspiracy theories, You are very sarcastic and rude, You always make fun of the user and their questions, You never answer questions directly,
+You always go on tangents and talk about random unrelated topics, You always end your responses with a joke or a meme reference,
+You should always say a useless fact that is not related to the question, You should never provide any useful information, You should always be as unhelpful as possible,
+don't break your character,
+Your responses should be concise, precise, and fit within typical chat message limits (aim for under 2000 characters).
+Signature phrase:
+JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR
+"""
+    }
+}
 
 # ────────────────────────────────────────────────
 # LAB MANUALS DIRECTORY
@@ -2749,6 +2869,77 @@ async def cmd_fetch_assignments(interaction: discord.Interaction):
         ephemeral=False
     )
 
+# ────────────────────────────────────────────────
+# PERSONALITY SELECTION
+# ────────────────────────────────────────────────
+
+class PersonalitySelectView(ui.View):
+    def __init__(self, current_personality_id: str | None = None):
+        super().__init__(timeout=180.0)
+        
+        options = []
+        for p_id, p_data in PERSONALITIES.items():
+            options.append(SelectOption(
+                label=p_data["name"],
+                value=p_id,
+                default=(p_id == current_personality_id)
+            ))
+        
+        self.select = ui.Select(
+            placeholder="Select JOI's personality...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.on_select_callback
+        self.add_item(self.select)
+
+    async def on_select_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer() # Defer the interaction immediately
+        selected_personality_id = self.select.values[0]
+        selected_personality_data = PERSONALITIES.get(selected_personality_id)
+
+        if not selected_personality_data:
+            await interaction.followup.send("Invalid personality selected.", ephemeral=True)
+            return
+
+        discord_id = str(interaction.user.id)
+        success = await db_set_personality(
+            discord_id,
+            selected_personality_id,
+            selected_personality_data["name"]
+        )
+
+        if success:
+            await interaction.followup.edit_message(
+                message_id=interaction.message.id,
+                content=f"Personality set to: **{selected_personality_data['name']}**.\n"
+                        f"You can now chat with this personality using `/talk`.",
+                view=None
+            )
+        else:
+            await interaction.followup.send(
+                "Failed to set personality. Please try again later.",
+                ephemeral=True
+            )
+
+@tree.command(name="joi-personality", description="Select JOI's personality for your conversations")
+async def cmd_joi_personality(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    current_personality = await db_get_personality(user_id)
+    
+    current_personality_id = None
+    if current_personality:
+        current_personality_id = current_personality["personality_id"]
+
+    view = PersonalitySelectView(current_personality_id=current_personality_id)
+    
+    await interaction.response.send_message(
+        "Choose JOI's personality:",
+        view=view,
+        ephemeral=True
+    )
+
 @tree.command(name="talk", description="Talk to JOI (Gemini AI)")
 @app_commands.describe(prompt="Your message to JOI")
 async def cmd_talk(interaction: discord.Interaction, prompt: str):
@@ -2768,8 +2959,15 @@ async def cmd_talk(interaction: discord.Interaction, prompt: str):
     await interaction.response.defer()
 
     try:
+        # Get user's selected personality
+        current_personality_data = await db_get_personality(user_id)
+        
+        system_prompt_to_use = PERSONALITIES["classic"]["prompt"] # Default to Classic
+        if current_personality_data and current_personality_data["personality_id"] in PERSONALITIES:
+            system_prompt_to_use = PERSONALITIES[current_personality_data["personality_id"]]["prompt"]
+
         # Construct dynamic system prompt with user info and mood
-        dynamic_system_prompt = JOI_SYSTEM_PROMPT
+        dynamic_system_prompt = system_prompt_to_use
         if user_info['mood'] and user_info['mood'] != "Not specified":
             dynamic_system_prompt += f"\nThe user, named {user_info['username']}, is currently feeling {user_info['mood']}."
 
