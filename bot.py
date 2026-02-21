@@ -10,7 +10,7 @@ import discord
 from discord import app_commands, ui, SelectOption
 from discord.ext import commands
 from dotenv import load_dotenv
-import google.genai as genai
+import google.generativeai as genai
 from aiohttp import web
 import mysql.connector
 from mysql.connector import Error
@@ -29,6 +29,7 @@ load_dotenv()
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
 DEFAULT_GUILD_ID = os.getenv("DEFAULT_GUILD_ID")
 
 MYSQL_HOST = os.getenv("MYSQL_HOST")
@@ -2783,7 +2784,7 @@ async def cmd_talk(interaction: discord.Interaction, prompt: str):
             if conv_turn["bot_response"]:
                 history_for_gemini.append({"role": "model", "parts": [conv_turn["bot_response"]]})
 
-        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=dynamic_system_prompt, api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=dynamic_system_prompt)
         chat = model.start_chat(history=history_for_gemini) # Initialize chat with history
 
         response = chat.send_message(prompt)
