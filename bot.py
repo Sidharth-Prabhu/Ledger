@@ -2991,7 +2991,26 @@ async def cmd_talk(interaction: discord.Interaction, prompt: str):
         if len(response_text) > 2000:
             response_text = response_text[:1997] + "..."
 
-        await interaction.followup.send(response_text)
+        full_response_content = f"**You:** {prompt}\n**JOI:** {response_text}"
+        
+        # Discord message limit is 2000 characters.
+        # If the combined message exceeds this, we need to truncate.
+        # Prioritize showing the full prompt and then as much of the response as possible.
+        if len(full_response_content) > 2000:
+            # Calculate available space for response_text after "You: {prompt}\nJOI: "
+            # Adding 12 for "**You:** ", 10 for "\n**JOI:** " and 3 for "..."
+            prompt_prefix_len = len(f"**You:** {prompt}\n**JOI:** ")
+            available_for_response = 2000 - prompt_prefix_len - 3 # -3 for ellipsis
+
+            if available_for_response > 0:
+                truncated_response_text = response_text[:available_for_response] + "..."
+                full_response_content = f"**You:** {prompt}\n**JOI:** {truncated_response_text}"
+            else:
+                # Fallback if prompt is too long itself, though unlikely for a prompt field
+                full_response_content = f"**You:** {prompt[:1990]}...\n**JOI:** (Response too long)"
+
+
+        await interaction.followup.send(full_response_content)
 
         # Log the current conversation turn
         await db_add_conversation(user_id, prompt, response_text)
